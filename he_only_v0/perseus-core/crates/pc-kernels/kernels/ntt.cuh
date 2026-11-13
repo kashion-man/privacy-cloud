@@ -1,0 +1,1233 @@
+// NTT (register passes) generic over the word W: N = 2^16 as 256 x 256.
+//  column pass: 256 threads = 16 columns x 16 threads; a thread holds 16 rows of its column, 4 butterfly stages in
+//               registers, one shared-memory transpose, 4 more stages in registers. Chunks of at most COLS8_MAX rows,
+//               whose passes are latency-bound, run on 8-column blocks: 32 threads per column, 8 rows each, 3 + 3 + 2
+//               stages around two transposes (twice the blocks at half the work per thread).
+//  row pass:    one warp per 256-element row, 8 elements per lane: 3 stages in registers, a warp-local transpose,
+//               2 stages across lane pairs (shuffles), 3 stages in registers (no block barrier).
+// Only Shoup products (twiddles are constants), so the kernels do not depend on the ModMul strategy. NttArgs.lazy (u32,
+// every prime < 2^30): lazy (Harvey) butterflies, forward words in [0, 4p) (below 16p at lazy 2, every prime < 2^28)
+// and inverse words in [0, 2p) between stages; either way a transform returns canonical words. Out-of-place first pass (`soff`) and the forward epilogues (`epi`): NttArgs.
+#pragma once
+#include "arith.cuh"
+
+namespace pc {
+namespace ntt {
+template <class W>
+constexpr int PH = sizeof(W) == 8 ? 2 : 1;  // transpose phases of a 32-column pass (coeffrows.cuh; shared memory <= 32 KB)
+
+template <class W>
+__device__ __forceinline__ void ct_bf(W& a, W& b, W w, W ws, W p) {
+    const W v = mul_shoup<W>(b, w, ws, p);
+    const W u = a;
+    a = add<W>(u, v, p);
+    b = sub<W>(u, v, p);
+}
+template <class W>
+__device__ __forceinline__ void gs_bf(W& a, W& b, W w, W ws, W p) {
+    const W u = a, v = b;
+    a = add<W>(u, v, p);
+    b = mul_shoup<W>(sub<W>(u, v, p), w, ws, p);
+}
+
+// Butterflies of the 2^16 transforms, lazy when L > 0 at u32 (other words keep the reduced ones): the Shoup product
+// without its last correction is in [0, 2p) for any operand; gs_lz takes and gives [0, 2p); ct_lz (stage S = 1..16
+// of the forward transform, m = 2^(S-1)) at L = 1 takes and gives [0, 4p). L = 2 (every prime < 2^28, so 16p < 2^32)
+// lets forward words grow by 2p a stage from [0, 4p) and takes the upper operand back below 8p at stages 7, 11 and 15
+// only: words stay below 16p, a column pass returns words below 12p, the row pass takes them and canonicalizes.
+template <class W, int L>
+constexpr bool LAZY = L > 0 && sizeof(W) == 4;
+template <class W>
+__device__ __forceinline__ W shoup_lz(W a, W w, W ws, W p) {
+    return (W)(wlo(a, w) - wlo(Word<W>::mulhi(a, ws), p));
+}
+// k p as a register the compiler cannot fold back into a multiple of p (it would turn every lazy "x - 2p" and
+// "2p - t + u" into an IMAD on the FMA pipe, which the row passes saturate, instead of an ALU add)
+template <class W>
+__device__ __forceinline__ W kp(W p, int k) {
+    if constexpr (sizeof(W) == 4) return __shfl_sync(0xffffffffu, k * p, 0);
+    else return (W)(k * p);
+}
+// a >= 2p ? a - 2p : a (p2 = 2p)
+template <class W>
+__device__ __forceinline__ W red2p(W a, W p2) {
+    return a >= p2 ? (W)(a - p2) : a;
+}
+// a forward lazy word (below 4p at L = 1, 12p at L = 2) as its residue in [0, p)
+template <class W, int L>
+__device__ __forceinline__ W canon(W a, W p, W p2, W p4, W p8) {
+    if constexpr (LAZY<W, L>) {
+        if constexpr (L == 2) {
+            a = red2p<W>(a, p8);
+            a = red2p<W>(a, p4);
+        }
+        a = red2p<W>(a, p2);
+        return a >= p ? (W)(a - p) : a;
+    }
+    return a;
+}
+// the upper operand of forward stage S (see LAZY)
+template <class W, int L>
+__device__ __forceinline__ W ct_u(W a, int S, W p2, W p8) {
+    if constexpr (L == 2) return (S == 7 || S == 11 || S == 15) ? red2p<W>(a, p8) : a;
+    else return red2p<W>(a, p2);
+}
+// CT with the second operand's product t already taken (t in [0, 2p) when lazy, [0, p) otherwise)
+template <class W, int L>
+__device__ __forceinline__ void ct_t(W& a, W& b, W t, W p, W p2, W p8, int S) {
+    if constexpr (LAZY<W, L>) {
+        const W u = ct_u<W, L>(a, S, p2, p8);
+        a = u + t;
+        b = (W)(u - t + p2);
+    } else {
+        const W u = a;
+        a = add<W>(u, t, p);
+        b = sub<W>(u, t, p);
+    }
+}
+template <class W, int L>
+__device__ __forceinline__ W mul_lz(W b, W w, W ws, W p) {
+    if constexpr (LAZY<W, L>) return shoup_lz<W>(b, w, ws, p);
+    return mul_shoup<W>(b, w, ws, p);
+}
+template <class W, int L>
+__device__ __forceinline__ void ct_lz(W& a, W& b, W w, W ws, W p, W p2, W p8, int S) {
+    ct_t<W, L>(a, b, mul_lz<W, L>(b, w, ws, p), p, p2, p8, S);
+}
+// GS: (a + b, (a - b) w)
+template <class W, int L>
+__device__ __forceinline__ W gs_sum(W a, W b, W p, W p2) {
+    if constexpr (LAZY<W, L>) return red2p<W>(a + b, p2);
+    return add<W>(a, b, p);
+}
+template <class W, int L>
+__device__ __forceinline__ W gs_dif(W a, W b, W p, W p2) {
+    if constexpr (LAZY<W, L>) return (W)(a - b + p2);
+    return sub<W>(a, b, p);
+}
+template <class W, int L>
+__device__ __forceinline__ void gs_lz(W& a, W& b, W w, W ws, W p, W p2) {
+    const W u = a, v = b;
+    a = gs_sum<W, L>(u, v, p, p2);
+    b = mul_lz<W, L>(gs_dif<W, L>(u, v, p, p2), w, ws, p);
+}
+
+// A row-pass stage across lane pairs (l, l ^ d) on 8 slots per lane (`lo`: the lane holding the pair's upper words):
+// each lane takes the butterflies of half the slots, the low lane slots k < 4 and the high lane slots k + 4 (one
+// exchange in, one out per slot pair), so every product is taken once instead of on both lanes.
+template <class W, int L>
+__device__ __forceinline__ void ct_pair(W (&x)[8], int d, bool lo, W tw, W tws, W p, W p2, W p8, int S) {
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const W r = shfl_xor<W>(0xffffffffu, lo ? x[k + 4] : x[k], d);
+        W U = lo ? x[k] : r, V = lo ? r : x[k + 4];  // slot k on the low lane, k + 4 on the high one
+        ct_t<W, L>(U, V, mul_lz<W, L>(V, tw, tws, p), p, p2, p8, S);
+        const W b = shfl_xor<W>(0xffffffffu, lo ? V : U, d);
+        x[k] = lo ? U : b;
+        x[k + 4] = lo ? b : V;
+    }
+}
+// ct_pair's GS counterpart: the low lane keeps the sums, the high lane the products
+template <class W, int L>
+__device__ __forceinline__ void gs_pair(W (&x)[8], int d, bool lo, W tw, W tws, W p, W p2) {
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const W r = shfl_xor<W>(0xffffffffu, lo ? x[k + 4] : x[k], d);
+        const W U = lo ? x[k] : r, V = lo ? r : x[k + 4];
+        const W sum = gs_sum<W, L>(U, V, p, p2), prod = mul_lz<W, L>(gs_dif<W, L>(U, V, p, p2), tw, tws, p);
+        const W b = shfl_xor<W>(0xffffffffu, lo ? prod : sum, d);
+        x[k] = lo ? sum : b;
+        x[k + 4] = lo ? b : prod;
+    }
+}
+
+// Row-pass twiddles of the last three stages (m = 2^s, s = 13..15) from two factors in the table: it holds
+// psi^brev16(k), so entries of disjoint index bits multiply, and for i = R 2^(s-8) + c (c < 2^(s-8)) w[m + i] = U V
+// with U = w[m + (R << (s-8))] (uniform per warp) and V = w[c] (the table's first 128 entries, L1-resident). The two
+// Shoup products give the same residue as one product by the full twiddle, while the row pass reads ~1/8 of the
+// twiddle bytes.
+template <class W, int L>
+__device__ __forceinline__ W mul_uv(W x, W u, W us, W v, W vs, W p) {
+    return mul_lz<W, L>(mul_lz<W, L>(x, u, us, p), v, vs, p);
+}
+// n consecutive table entries at w (16-byte aligned for n = 4, 8-byte for n = 2: the tables are 256-byte aligned
+// and every run starts at a multiple of n)
+template <class W, int n>
+__device__ __forceinline__ void ldtw(const W* w, W (&v)[n]) {
+    if constexpr (n == 4) {
+        const V4<W> a = ldg4<W>(w);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) v[k] = a.v[k];
+    } else if constexpr (n == 2 && sizeof(W) == 4) {
+        const uint2 a = __ldg((const uint2*)w);
+        v[0] = a.x;
+        v[1] = a.y;
+    } else {
+#pragma unroll
+        for (int k = 0; k < n; ++k) v[k] = __ldg(w + k);
+    }
+}
+
+// 4 consecutive words of the sum mod p of n rows `stride` words apart (n >= 1)
+template <class W>
+__device__ __forceinline__ V4<W> load4_sum(const W* a, int n, uint64_t stride, W p) {
+    V4<W> x = load4<W>(a);
+    for (int j = 1; j < n; ++j) {
+        const V4<W> y = load4<W>(a + j * stride);
+#pragma unroll
+        for (int u = 0; u < 4; ++u) x.v[u] = add<W>(x.v[u], y.v[u], p);
+    }
+    return x;
+}
+
+// Programmatic dependent launch of a transform's second pass: the first pass lets it launch at once (its blocks fill
+// the slots the first pass frees and set up), the second pass waits for the first grid's completion (and its memory)
+// before its first data access (pc::pdl_trigger / pc::pdl_wait).
+template <class... P, class... A>
+void launch_pdl_t(void (*k)(P...), dim3 g, int threads, cudaStream_t s, A... a) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = g;
+    cfg.blockDim = dim3(threads);
+    cfg.stream = s;
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = at;
+    cfg.numAttrs = 1;
+    cudaLaunchKernelEx(&cfg, k, a...);
+}
+template <class... P, class... A>
+void launch_pdl(void (*k)(P...), dim3 g, cudaStream_t s, A... a) {
+    launch_pdl_t(k, g, 256, s, a...);
+}
+
+// NttArgs.epi on 4 consecutive transform values v of word r (prime p, scalar s with Shoup companion ss)
+template <class W>
+__device__ __forceinline__ void epi4(const NttArgs& T, size_t r, const W* v, W s, W ss, W p) {
+    W* o = (W*)T.eout + r;
+    const V4<W> x = load4_sum<W>((const W*)T.ex + r, T.xnum, T.xstride, p);
+    V4<W> d{};
+    if (T.epi == 2) d = load4<W>(T.ed ? (const W*)T.ed + r : o);
+    W y[4];
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+        if (T.epi == 3) {
+            y[u] = add<W>(mul_shoup<W>(x.v[u], s, ss, p), v[u], p);
+        } else {
+            y[u] = mul_shoup<W>(sub<W>(x.v[u], v[u], p), s, ss, p);
+            if (T.epi == 2) y[u] = add<W>(d.v[u], y[u], p);
+        }
+    }
+    store4<W>(o, y[0], y[1], y[2], y[3]);
+}
+
+// ---------------------------------------------------------------- forward column passes
+// The column pass of one 16-column block of a row (prime p, twiddles w / ws) on x = the block's words held as
+// x[j] = word (q + 16 j) * 256 + c (canonical), stored at a (the block's first word); s: the transpose buffer.
+template <class W, int L>
+__device__ __forceinline__ void fwd_cols_core(W (&x)[16], W* a, W* s, const W* w, const W* ws, W p, int c, int q) {
+    const W p2 = kp<W>(p, 2);
+    const W p8 = L == 2 ? kp<W>(p, 8) : (W)0;
+    // stages tr = 128..16 (m = 1..8): pairs (j, j + tr/16), group i = j / (2 tr/16)
+#pragma unroll
+    for (int st = 0; st < 4; ++st) {
+        const int h = 8 >> st;  // tr / 16
+        const int m = 1 << st;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            if ((j & h) == 0) {
+                const int i = j / (2 * h);
+                ct_lz<W, L>(x[j], x[j + h], __ldg(w + m + i), __ldg(ws + m + i), p, p2, p8, st + 1);
+            }
+        }
+    }
+    // now the 16 consecutive rows of group q: x[u] = row 16 q + u
+#pragma unroll
+    for (int j = 0; j < 16; ++j) s[(q + 16 * j) * 16 + c] = x[j];
+    __syncthreads();
+#pragma unroll
+    for (int u = 0; u < 16; ++u) x[u] = s[(16 * q + u) * 16 + c];
+    // stages tr = 8..1 (m = 16..128): pairs (u, u + tr), group i = (16 q + u) / (2 tr)
+#pragma unroll
+    for (int st = 0; st < 4; ++st) {
+        const int h = 8 >> st;  // tr
+        const int m = 16 << st;
+#pragma unroll
+        for (int u = 0; u < 16; ++u) {
+            if ((u & h) == 0) {
+                const int i = (m >> 4) * q + u / (2 * h);
+                ct_lz<W, L>(x[u], x[u + h], __ldg(w + m + i), __ldg(ws + m + i), p, p2, p8, st + 5);
+            }
+        }
+    }
+#pragma unroll
+    for (int u = 0; u < 16; ++u) a[(16 * q + u) * 256 + c] = x[u];
+}
+
+template <class W, int L>
+__global__ void __launch_bounds__(256) ntt_fwd_cols(NttArgs T) {
+    __shared__ W s[256 * 16];
+    pdl_trigger();
+    const int row = blockIdx.y;
+    W* a = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 16;
+    const W* in = T.soff ? (const W*)T.src + (size_t)T.soff[row] * N + blockIdx.x * 16 : a;
+    const int pid = T.rprime[row];
+    const W p = (W)T.pr[pid].p;
+    const W p2 = kp<W>(p, 2);
+    const int c = threadIdx.x & 15, q = threadIdx.x >> 4;
+    W x[16];
+    pdl_wait();
+#pragma unroll
+    for (int j = 0; j < 16; ++j) x[j] = in[(q + 16 * j) * 256 + c];
+    for (int m = 1; m < T.snum; ++m) {
+#pragma unroll
+        for (int j = 0; j < 16; ++j) x[j] = add<W>(x[j], in[m * T.sstride + (q + 16 * j) * 256 + c], p);
+    }
+    fwd_cols_core<W, L>(x, a, s, (const W*)T.fw + (size_t)pid * N, (const W*)T.fws + (size_t)pid * N, p, c, q);
+}
+
+// The column pass of a short chunk on 8-column blocks, x[j] in three layouts: rows q + 32 j (tr = 128..32), rows
+// lo + 4 j + 32 hi with q = 4 hi + lo (tr = 16..4), rows 8 q + u (tr = 2, 1).
+template <class W, int L>
+__global__ void __launch_bounds__(256) ntt_fwd_cols8(NttArgs T) {
+    __shared__ W s[256 * 8];
+    pdl_trigger();
+    const int row = blockIdx.y;
+    W* a = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 8;
+    const W* in = T.soff ? (const W*)T.src + (size_t)T.soff[row] * N + blockIdx.x * 8 : a;
+    const int pid = T.rprime[row];
+    const W p = (W)T.pr[pid].p;
+    const W p2 = kp<W>(p, 2);
+    const W p8 = L == 2 ? kp<W>(p, 8) : (W)0;
+    const W* w = (const W*)T.fw + (size_t)pid * N;
+    const W* ws = (const W*)T.fws + (size_t)pid * N;
+    const int c = threadIdx.x & 7, q = threadIdx.x >> 3, lo = q & 3, hi = q >> 2;
+    W x[8];
+    pdl_wait();
+#pragma unroll
+    for (int j = 0; j < 8; ++j) x[j] = in[(q + 32 * j) * 256 + c];
+    for (int m = 1; m < T.snum; ++m) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) x[j] = add<W>(x[j], in[m * T.sstride + (q + 32 * j) * 256 + c], p);
+    }
+#pragma unroll
+    for (int st = 0; st < 3; ++st) {  // m = 1, 2, 4
+        const int h = 4 >> st, m = 1 << st;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            if ((j & h) == 0) ct_lz<W, L>(x[j], x[j + h], __ldg(w + m + j / (2 * h)), __ldg(ws + m + j / (2 * h)), p, p2, p8, st + 1);
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) s[(q + 32 * j) * 8 + c] = x[j];
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 8; ++j) x[j] = s[(lo + 4 * j + 32 * hi) * 8 + c];
+#pragma unroll
+    for (int st = 0; st < 3; ++st) {  // m = 8, 16, 32: group (lo + 4 j + 32 hi) / (2 tr)
+        const int h = 4 >> st, m = 8 << st;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            if ((j & h) == 0) {
+                const int i = (m >> 3) * hi + j / (2 * h);
+                ct_lz<W, L>(x[j], x[j + h], __ldg(w + m + i), __ldg(ws + m + i), p, p2, p8, st + 4);
+            }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 8; ++j) s[(lo + 4 * j + 32 * hi) * 8 + c] = x[j];
+    __syncthreads();
+#pragma unroll
+    for (int u = 0; u < 8; ++u) x[u] = s[(8 * q + u) * 8 + c];
+#pragma unroll
+    for (int st = 0; st < 2; ++st) {  // m = 64, 128: group (8 q + u) / (2 tr)
+        const int h = 2 >> st, m = 64 << st;
+#pragma unroll
+        for (int u = 0; u < 8; ++u)
+            if ((u & h) == 0) {
+                const int i = (m >> 5) * q + u / (2 * h);
+                ct_lz<W, L>(x[u], x[u + h], __ldg(w + m + i), __ldg(ws + m + i), p, p2, p8, st + 7);
+            }
+    }
+#pragma unroll
+    for (int u = 0; u < 8; ++u) a[(8 * q + u) * 256 + c] = x[u];
+}
+
+// ---------------------------------------------------------------- forward row pass (warp per row, 8 rows per block)
+// Both row passes at 48 registers: 5 blocks per SM (their loads wait on L2; more warps hide it).
+template <class W, int L>
+__global__ void __launch_bounds__(256, 5) ntt_fwd_rows(NttArgs T) {
+    __shared__ W s[8][256 + 8];
+    const int row = blockIdx.y;
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+    const int R = blockIdx.x * 8 + wp;  // 256-element row inside the limb
+    W* a = (W*)T.base + (size_t)T.roff[row] * N + R * 256;
+    const int pid = T.rprime[row];
+    const W p = (W)T.pr[pid].p;
+    const W p2 = kp<W>(p, 2);
+    const W p4 = L == 2 ? kp<W>(p, 4) : (W)0, p8 = L == 2 ? kp<W>(p, 8) : (W)0;
+    const W* w = (const W*)T.fw + (size_t)pid * N;
+    const W* ws = (const W*)T.fws + (size_t)pid * N;
+    W x[8];
+    pdl_wait();
+    // layout A: x[j] = e = lane + 32 j
+#pragma unroll
+    for (int j = 0; j < 8; ++j) x[j] = a[lane + 32 * j];
+    {  // t = 128, m = 256: i = 0 -> index 256 + R
+        const W tw = __ldg(w + 256 + R), tws = __ldg(ws + 256 + R);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) ct_lz<W, L>(x[j], x[j + 4], tw, tws, p, p2, p8, 9);
+    }
+    {  // t = 64, m = 512: i = j / 4 (j<4 -> 0); pairs (j, j+2) for j in {0,1,4,5}
+#pragma unroll
+        for (int hb = 0; hb < 2; ++hb) {
+            const int ti = 512 + 2 * R + hb;
+            const W tw = __ldg(w + ti), tws = __ldg(ws + ti);
+            ct_lz<W, L>(x[4 * hb], x[4 * hb + 2], tw, tws, p, p2, p8, 10);
+            ct_lz<W, L>(x[4 * hb + 1], x[4 * hb + 3], tw, tws, p, p2, p8, 10);
+        }
+    }
+    {  // t = 32, m = 1024: i = j / 2; pairs (j, j+1) for even j
+#pragma unroll
+        for (int qb = 0; qb < 4; ++qb) {
+            const int ti = 1024 + 4 * R + qb;
+            const W tw = __ldg(w + ti), tws = __ldg(ws + ti);
+            ct_lz<W, L>(x[2 * qb], x[2 * qb + 1], tw, tws, p, p2, p8, 11);
+        }
+    }
+    // warp-local transpose to layout B: x[u] = e = 8 lane + u
+#pragma unroll
+    for (int j = 0; j < 8; ++j) s[wp][lane + 32 * j + ((lane + 32 * j) >> 5)] = x[j];
+    __syncwarp();
+#pragma unroll
+    for (int u = 0; u < 8; ++u) {
+        const int e = 8 * lane + u;
+        x[u] = s[wp][e + (e >> 5)];
+    }
+    // t = 16, m = 2048: pair (e, e+16) = lanes (l, l^2); i_local = e / 32 = lane / 4
+    {
+        const int ti = 2048 + 8 * R + (lane >> 2);
+        const W tw = __ldg(w + ti), tws = __ldg(ws + ti);
+        ct_pair<W, L>(x, 2, (lane & 2) == 0, tw, tws, p, p2, p8, 12);
+    }
+    // t = 8, m = 4096: pair (e, e+8) = lanes (l, l^1); i_local = e / 16 = lane / 2
+    {
+        const int ti = 4096 + 16 * R + (lane >> 1);
+        const W tw = __ldg(w + ti), tws = __ldg(ws + ti);
+        ct_pair<W, L>(x, 1, (lane & 1) == 0, tw, tws, p, p2, p8, 13);
+    }
+    // CT butterfly with the factored twiddle U V
+    auto ct_uv = [&](W& a, W& b, W u, W us, W v, W vs, int S) { ct_t<W, L>(a, b, mul_uv<W, L>(b, u, us, v, vs, p), p, p2, p8, S); };
+    {  // t = 4, m = 8192: i_local = e / 8 = lane
+        const W u = __ldg(w + 8192 + 32 * R), us = __ldg(ws + 8192 + 32 * R), v = __ldg(w + lane), vs = __ldg(ws + lane);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) ct_uv(x[k], x[k + 4], u, us, v, vs, 14);
+    }
+    {  // t = 2, m = 16384: i_local = e / 4 = 2 lane + u/4
+        const W u = __ldg(w + 16384 + 64 * R), us = __ldg(ws + 16384 + 64 * R);
+        W v[2], vs[2];
+        ldtw<W, 2>(w + 2 * lane, v);
+        ldtw<W, 2>(ws + 2 * lane, vs);
+#pragma unroll
+        for (int hb = 0; hb < 2; ++hb) {
+            ct_uv(x[4 * hb], x[4 * hb + 2], u, us, v[hb], vs[hb], 15);
+            ct_uv(x[4 * hb + 1], x[4 * hb + 3], u, us, v[hb], vs[hb], 15);
+        }
+    }
+    {  // t = 1, m = 32768: i_local = e / 2 = 4 lane + u/2
+        const W u = __ldg(w + 32768 + 128 * R), us = __ldg(ws + 32768 + 128 * R);
+        W v[4], vs[4];
+        ldtw<W, 4>(w + 4 * lane, v);
+        ldtw<W, 4>(ws + 4 * lane, vs);
+#pragma unroll
+        for (int qb = 0; qb < 4; ++qb) ct_uv(x[2 * qb], x[2 * qb + 1], u, us, v[qb], vs[qb], 16);
+    }
+    // store: layout B is 8 consecutive elements per lane -> vectorized, canonical words (at L = 2 a word below 16p by
+    // one quotient estimate q = floor(x floor(2^32 / p) / 2^32), x - q p in [0, 2p), and one conditional subtraction)
+    if constexpr (L == 2 && sizeof(W) == 4) {
+        const uint32_t m = (uint32_t)(T.pr[pid].mu_lo >> 32);
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            const W r = x[u] - __umulhi(x[u], m) * p;
+            x[u] = r >= p ? r - p : r;
+        }
+    } else {
+#pragma unroll
+        for (int u = 0; u < 8; ++u) x[u] = canon<W, L>(x[u], p, p2, p4, p8);
+    }
+    if (T.epi) {
+        const size_t r = (size_t)T.roff[row] * N + R * 256 + 8 * lane;
+        const W s = ((const W*)T.es)[pid], ss = ((const W*)T.ess)[pid];
+        epi4<W>(T, r, x, s, ss, p);
+        epi4<W>(T, r + 4, x + 4, s, ss, p);
+        return;
+    }
+    store4<W>(a + 8 * lane, x[0], x[1], x[2], x[3]);
+    store4<W>(a + 8 * lane + 4, x[4], x[5], x[6], x[7]);
+}
+
+// ---------------------------------------------------------------- inverse row pass (GS, t = 1 .. 128)
+template <class W, int L>
+__global__ void __launch_bounds__(256, 5) ntt_inv_rows(NttArgs T) {
+    __shared__ W s[8][256 + 8];
+    pdl_trigger();
+    const int row = blockIdx.y;
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+    const int R = blockIdx.x * 8 + wp;
+    W* a = (W*)T.base + (size_t)T.roff[row] * N + R * 256;
+    const W* in = T.soff ? (const W*)T.src + (size_t)T.soff[row] * N + R * 256 : a;
+    const int pid = T.rprime[row];
+    const W p = (W)T.pr[pid].p;
+    const W p2 = kp<W>(p, 2);
+    const W* w = (const W*)T.iw + (size_t)pid * N;
+    const W* ws = (const W*)T.iws + (size_t)pid * N;
+    W x[8];
+    {
+        const V4<W> v0 = load4_sum<W>(in + 8 * lane, T.snum, T.sstride, p), v1 = load4_sum<W>(in + 8 * lane + 4, T.snum, T.sstride, p);
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            x[u] = v0.v[u];
+            x[4 + u] = v1.v[u];
+        }
+    }
+    // GS butterfly with the factored twiddle U V (inverse table)
+    auto gs_uv = [&](W& a, W& b, W u, W us, W v, W vs) {
+        const W x0 = a, x1 = b;
+        a = gs_sum<W, L>(x0, x1, p, p2);
+        b = mul_uv<W, L>(gs_dif<W, L>(x0, x1, p, p2), u, us, v, vs, p);
+    };
+    {  // t = 1, m = 32768: i_local = 4 lane + qb
+        const W u = __ldg(w + 32768 + 128 * R), us = __ldg(ws + 32768 + 128 * R);
+        W v[4], vs[4];
+        ldtw<W, 4>(w + 4 * lane, v);
+        ldtw<W, 4>(ws + 4 * lane, vs);
+#pragma unroll
+        for (int qb = 0; qb < 4; ++qb) gs_uv(x[2 * qb], x[2 * qb + 1], u, us, v[qb], vs[qb]);
+    }
+    {  // t = 2, m = 16384: i_local = 2 lane + hb
+        const W u = __ldg(w + 16384 + 64 * R), us = __ldg(ws + 16384 + 64 * R);
+        W v[2], vs[2];
+        ldtw<W, 2>(w + 2 * lane, v);
+        ldtw<W, 2>(ws + 2 * lane, vs);
+#pragma unroll
+        for (int hb = 0; hb < 2; ++hb) {
+            gs_uv(x[4 * hb], x[4 * hb + 2], u, us, v[hb], vs[hb]);
+            gs_uv(x[4 * hb + 1], x[4 * hb + 3], u, us, v[hb], vs[hb]);
+        }
+    }
+    {  // t = 4, m = 8192: i_local = lane
+        const W u = __ldg(w + 8192 + 32 * R), us = __ldg(ws + 8192 + 32 * R), v = __ldg(w + lane), vs = __ldg(ws + lane);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) gs_uv(x[k], x[k + 4], u, us, v, vs);
+    }
+    {  // t = 8, m = 4096: lanes (l, l^1)
+        const int ti = 4096 + 16 * R + (lane >> 1);
+        const W tw = __ldg(w + ti), tws = __ldg(ws + ti);
+        gs_pair<W, L>(x, 1, (lane & 1) == 0, tw, tws, p, p2);
+    }
+    {  // t = 16, m = 2048: lanes (l, l^2)
+        const int ti = 2048 + 8 * R + (lane >> 2);
+        const W tw = __ldg(w + ti), tws = __ldg(ws + ti);
+        gs_pair<W, L>(x, 2, (lane & 2) == 0, tw, tws, p, p2);
+    }
+    // transpose B -> A
+#pragma unroll
+    for (int u = 0; u < 8; ++u) {
+        const int e = 8 * lane + u;
+        s[wp][e + (e >> 5)] = x[u];
+    }
+    __syncwarp();
+#pragma unroll
+    for (int j = 0; j < 8; ++j) x[j] = s[wp][lane + 32 * j + ((lane + 32 * j) >> 5)];
+    {  // t = 32, m = 1024
+#pragma unroll
+        for (int qb = 0; qb < 4; ++qb) {
+            const int ti = 1024 + 4 * R + qb;
+            gs_lz<W, L>(x[2 * qb], x[2 * qb + 1], __ldg(w + ti), __ldg(ws + ti), p, p2);
+        }
+    }
+    {  // t = 64, m = 512
+#pragma unroll
+        for (int hb = 0; hb < 2; ++hb) {
+            const int ti = 512 + 2 * R + hb;
+            const W tw = __ldg(w + ti), tws = __ldg(ws + ti);
+            gs_lz<W, L>(x[4 * hb], x[4 * hb + 2], tw, tws, p, p2);
+            gs_lz<W, L>(x[4 * hb + 1], x[4 * hb + 3], tw, tws, p, p2);
+        }
+    }
+    {  // t = 128, m = 256
+        const W tw = __ldg(w + 256 + R), tws = __ldg(ws + 256 + R);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) gs_lz<W, L>(x[j], x[j + 4], tw, tws, p, p2);
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) a[lane + 32 * j] = x[j];
+}
+
+// ---------------------------------------------------------------- inverse column passes (GS tr = 1..128), N^-1
+// ntt_fwd_cols' layouts in reverse order: rows 16 q + u (tr = 1..8), one transpose, rows q + 16 j (tr = 16..128)
+template <class W, int L>
+__global__ void __launch_bounds__(256) ntt_inv_cols(NttArgs T) {
+    __shared__ W s[256 * 16];
+    pdl_trigger();
+    const int row = blockIdx.y;
+    W* a = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 16;
+    const int pid = T.rprime[row];
+    const W p = (W)T.pr[pid].p;
+    const W p2 = kp<W>(p, 2);
+    const W* w = (const W*)T.iw + (size_t)pid * N;
+    const W* ws = (const W*)T.iws + (size_t)pid * N;
+    const int c = threadIdx.x & 15, q = threadIdx.x >> 4;
+    W x[16];
+    pdl_wait();
+#pragma unroll
+    for (int u = 0; u < 16; ++u) x[u] = a[(16 * q + u) * 256 + c];
+#pragma unroll
+    for (int st = 3; st >= 0; --st) {  // m = 128..16
+        const int h = 8 >> st, m = 16 << st;
+#pragma unroll
+        for (int u = 0; u < 16; ++u) {
+            if ((u & h) == 0) {
+                const int i = (m >> 4) * q + u / (2 * h);
+                gs_lz<W, L>(x[u], x[u + h], __ldg(w + m + i), __ldg(ws + m + i), p, p2);
+            }
+        }
+    }
+#pragma unroll
+    for (int u = 0; u < 16; ++u) s[(16 * q + u) * 16 + c] = x[u];
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 16; ++j) x[j] = s[(q + 16 * j) * 16 + c];
+#pragma unroll
+    for (int st = 3; st >= 0; --st) {  // m = 8..1
+        const int h = 8 >> st, m = 1 << st;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            if ((j & h) == 0) {
+                const int i = j / (2 * h);
+                gs_lz<W, L>(x[j], x[j + h], __ldg(w + m + i), __ldg(ws + m + i), p, p2);
+            }
+        }
+    }
+    const W ni = T.es ? ((const W*)T.es)[row] : ((const W*)T.ninv)[pid], nis = T.es ? ((const W*)T.ess)[row] : ((const W*)T.ninvs)[pid];
+#pragma unroll
+    for (int j = 0; j < 16; ++j) a[(q + 16 * j) * 256 + c] = mul_shoup<W>(x[j], ni, nis, p);
+}
+
+// ntt_fwd_cols8's layouts in reverse order
+template <class W, int L>
+__global__ void __launch_bounds__(256) ntt_inv_cols8(NttArgs T) {
+    __shared__ W s[256 * 8];
+    pdl_trigger();
+    const int row = blockIdx.y;
+    W* a = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 8;
+    const int pid = T.rprime[row];
+    const W p = (W)T.pr[pid].p;
+    const W p2 = kp<W>(p, 2);
+    const W* w = (const W*)T.iw + (size_t)pid * N;
+    const W* ws = (const W*)T.iws + (size_t)pid * N;
+    const int c = threadIdx.x & 7, q = threadIdx.x >> 3, lo = q & 3, hi = q >> 2;
+    W x[8];
+    pdl_wait();
+#pragma unroll
+    for (int u = 0; u < 8; ++u) x[u] = a[(8 * q + u) * 256 + c];
+#pragma unroll
+    for (int st = 1; st >= 0; --st) {  // m = 128, 64
+        const int h = 2 >> st, m = 64 << st;
+#pragma unroll
+        for (int u = 0; u < 8; ++u)
+            if ((u & h) == 0) {
+                const int i = (m >> 5) * q + u / (2 * h);
+                gs_lz<W, L>(x[u], x[u + h], __ldg(w + m + i), __ldg(ws + m + i), p, p2);
+            }
+    }
+#pragma unroll
+    for (int u = 0; u < 8; ++u) s[(8 * q + u) * 8 + c] = x[u];
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 8; ++j) x[j] = s[(lo + 4 * j + 32 * hi) * 8 + c];
+#pragma unroll
+    for (int st = 2; st >= 0; --st) {  // m = 32, 16, 8
+        const int h = 4 >> st, m = 8 << st;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            if ((j & h) == 0) {
+                const int i = (m >> 3) * hi + j / (2 * h);
+                gs_lz<W, L>(x[j], x[j + h], __ldg(w + m + i), __ldg(ws + m + i), p, p2);
+            }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 8; ++j) s[(lo + 4 * j + 32 * hi) * 8 + c] = x[j];
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 8; ++j) x[j] = s[(q + 32 * j) * 8 + c];
+#pragma unroll
+    for (int st = 2; st >= 0; --st) {  // m = 4, 2, 1
+        const int h = 4 >> st, m = 1 << st;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            if ((j & h) == 0) gs_lz<W, L>(x[j], x[j + h], __ldg(w + m + j / (2 * h)), __ldg(ws + m + j / (2 * h)), p, p2);
+    }
+    const W ni = T.es ? ((const W*)T.es)[row] : ((const W*)T.ninv)[pid], nis = T.es ? ((const W*)T.ess)[row] : ((const W*)T.ninvs)[pid];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) a[(q + 32 * j) * 256 + c] = mul_shoup<W>(x[j], ni, nis, p);
+}
+
+// ---------------------------------------------------------------- u32 passes, multiply-pipe diet (sm_120)
+// On sm_120 IMAD.HI and IMAD.WIDE issue at a quarter of the FMA rate and IMAD at half, so the passes above spend a
+// large share of their multiply pipe on address arithmetic (pointer + int index = IMAD.WIDE) and on the final
+// quotient-estimate reduction. The u32 passes below take the same butterflies on the same stages (bit-exact):
+//  - addresses: a 64-bit row base once, then 32-bit byte offsets added on the ALU (`boff`);
+//  - the forward row pass's final reduction (words below 16p at lazy 2, 4p at lazy 1) by conditional subtractions;
+//  - column passes (16- and 8-column): the block stages its prime's twiddle pairs 1..255 in shared memory before
+//    waiting on its predecessor, so no butterfly stage waits on an L1 / L2 twiddle load;
+//  - inverse column passes: N^-1 (or the row scalar) folded into the last GS stage, whose one twiddle w is the
+//    block's: (u + v) ni and (u - v) (w ni), one product per output instead of two;
+//  - row passes on 4-row (4-warp) blocks: a shorter last wave than 8.
+// The u32 transforms (fwd / inv) and the rescale's NTT (cols_rs_d) run these passes.
+template <class T>
+__device__ __forceinline__ T* boff(T* p, uint32_t bytes) {
+    return (T*)((uint64_t)p + (uint64_t)bytes);
+}
+// (w[i], ws[i]) on the ALU-addressed path
+__device__ __forceinline__ uint2 tw2(const uint32_t* w, const uint32_t* ws, uint32_t i) {
+    uint2 r;
+    asm("ld.global.nc.u32 %0, [%1];" : "=r"(r.x) : "l"(boff(w, i << 2)));
+    asm("ld.global.nc.u32 %0, [%1];" : "=r"(r.y) : "l"(boff(ws, i << 2)));
+    return r;
+}
+// (w[i], ws[i]) and (w[i + 1], ws[i + 1]) as (x, y) and (z, w), i even
+__device__ __forceinline__ uint4 tw4(const uint32_t* w, const uint32_t* ws, uint32_t i) {
+    uint4 r;
+    asm("ld.global.nc.v2.u32 {%0, %1}, [%2];" : "=r"(r.x), "=r"(r.z) : "l"(boff(w, i << 2)));
+    asm("ld.global.nc.v2.u32 {%0, %1}, [%2];" : "=r"(r.y), "=r"(r.w) : "l"(boff(ws, i << 2)));
+    return r;
+}
+// a forward word below 16p (L = 2) / 4p (L = 1) as its residue, conditional subtractions only
+template <int L>
+__device__ __forceinline__ uint32_t canon_sub(uint32_t x, uint32_t p, uint32_t p2, uint32_t p4, uint32_t p8) {
+    if constexpr (L == 2) {
+        x = min(x, x - p8);
+        x = min(x, x - p4);
+    }
+    x = min(x, x - p2);
+    return min(x, x - p);
+}
+
+template <int L>
+__global__ void __launch_bounds__(256) ntt_fwd_cols_d(NttArgs T) {
+    using W = uint32_t;
+    __shared__ W s[256 * 16];
+    __shared__ uint2 st[256];
+    pdl_trigger();
+    const int row = blockIdx.y;
+    const uint32_t c = threadIdx.x & 15, q = threadIdx.x >> 4;
+    const int pid = T.rprime[row];
+    st[threadIdx.x] = tw2((const W*)T.fw + (size_t)pid * N, (const W*)T.fws + (size_t)pid * N, threadIdx.x);
+    W* const a = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 16 + c;
+    const W* const in = T.soff ? (const W*)T.src + (size_t)T.soff[row] * N + blockIdx.x * 16 + c : a;
+    const W p = (W)T.pr[pid].p;
+    const W p2 = kp<W>(p, 2);
+    const W p8 = L == 2 ? kp<W>(p, 8) : (W)0;
+    W x[16];
+    pdl_wait();
+#pragma unroll
+    for (int j = 0; j < 16; ++j) x[j] = *boff(in, ((q + 16 * j) * 256) << 2);
+    for (int m = 1; m < T.snum; ++m) {
+#pragma unroll
+        for (int j = 0; j < 16; ++j) x[j] = add<W>(x[j], in[m * T.sstride + (q + 16 * j) * 256], p);
+    }
+    __syncthreads();
+#pragma unroll
+    for (int sg = 0; sg < 4; ++sg) {  // m = 1..8
+        const int h = 8 >> sg, m = 1 << sg;
+#pragma unroll
+        for (int j = 0; j < 16; ++j)
+            if ((j & h) == 0) {
+                const uint2 t = st[m + j / (2 * h)];
+                ct_lz<W, L>(x[j], x[j + h], t.x, t.y, p, p2, p8, sg + 1);
+            }
+    }
+#pragma unroll
+    for (int j = 0; j < 16; ++j) s[(q + 16 * j) * 16 + c] = x[j];
+    __syncthreads();
+#pragma unroll
+    for (int u = 0; u < 16; ++u) x[u] = s[(16 * q + u) * 16 + c];
+#pragma unroll
+    for (int sg = 0; sg < 4; ++sg) {  // m = 16..128
+        const int h = 8 >> sg, m = 16 << sg;
+#pragma unroll
+        for (int u = 0; u < 16; ++u)
+            if ((u & h) == 0) {
+                const uint2 t = st[m + (m >> 4) * q + u / (2 * h)];
+                ct_lz<W, L>(x[u], x[u + h], t.x, t.y, p, p2, p8, sg + 5);
+            }
+    }
+#pragma unroll
+    for (int u = 0; u < 16; ++u) *boff(a, ((16 * q + u) * 256) << 2) = x[u];
+}
+
+// (w x mod p, its Shoup companion floor(wx 2^32 / p)) for a canonical twiddle w and a scalar x with companion xs:
+// the companion from mu = floor(2^64 / p) (an estimate that is exact or one short) and one correction, no division
+__device__ __forceinline__ uint2 fold_scalar(uint32_t w, uint32_t x, uint32_t xs, uint32_t p, uint64_t mu) {
+    const uint32_t wn = mul_shoup<uint32_t>(w, x, xs, p);
+    uint32_t est = (uint32_t)__umul64hi((uint64_t)wn << 32, mu);
+    const uint32_t r = 0u - est * p;  // wn 2^32 - est p, exactly (it is below 2p < 2^32)
+    if (r >= p) ++est;
+    return make_uint2(wn, est);
+}
+
+// the diet row passes run 4 rows (warps) per block: finer blocks, a shorter last wave (-3..-15 % on the pass)
+constexpr int ROWS_D = 4;
+template <int L>
+__global__ void __launch_bounds__(32 * ROWS_D, 10) ntt_fwd_rows_d(NttArgs T) {
+    using W = uint32_t;
+    __shared__ W s[ROWS_D][256 + 8];
+    const int row = blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+    const uint32_t R = blockIdx.x * ROWS_D + wp;
+    W* const a = (W*)T.base + (size_t)T.roff[row] * N + R * 256;
+    const int pid = T.rprime[row];
+    const W p = (W)T.pr[pid].p;
+    const W p2 = kp<W>(p, 2);
+    const W p4 = L == 2 ? kp<W>(p, 4) : (W)0, p8 = L == 2 ? kp<W>(p, 8) : (W)0;
+    const W* const w = (const W*)T.fw + (size_t)pid * N;
+    const W* const ws = (const W*)T.fws + (size_t)pid * N;
+    W x[8];
+    pdl_wait();
+#pragma unroll
+    for (int j = 0; j < 8; ++j) x[j] = *boff(a, (lane + 32 * j) << 2);
+    {  // t = 128
+        const uint2 t = tw2(w, ws, 256 + R);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) ct_lz<W, L>(x[j], x[j + 4], t.x, t.y, p, p2, p8, 9);
+    }
+    {  // t = 64
+        const uint4 t = tw4(w, ws, 512 + 2 * R);
+        ct_lz<W, L>(x[0], x[2], t.x, t.y, p, p2, p8, 10);
+        ct_lz<W, L>(x[1], x[3], t.x, t.y, p, p2, p8, 10);
+        ct_lz<W, L>(x[4], x[6], t.z, t.w, p, p2, p8, 10);
+        ct_lz<W, L>(x[5], x[7], t.z, t.w, p, p2, p8, 10);
+    }
+    {  // t = 32
+        const uint4 t0 = tw4(w, ws, 1024 + 4 * R), t1 = tw4(w, ws, 1026 + 4 * R);
+        ct_lz<W, L>(x[0], x[1], t0.x, t0.y, p, p2, p8, 11);
+        ct_lz<W, L>(x[2], x[3], t0.z, t0.w, p, p2, p8, 11);
+        ct_lz<W, L>(x[4], x[5], t1.x, t1.y, p, p2, p8, 11);
+        ct_lz<W, L>(x[6], x[7], t1.z, t1.w, p, p2, p8, 11);
+    }
+    W* const tb = s[wp];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) tb[lane + 32 * j + ((lane + 32 * j) >> 5)] = x[j];
+    __syncwarp();
+#pragma unroll
+    for (int u = 0; u < 8; ++u) {
+        const uint32_t e = 8 * lane + u;
+        x[u] = tb[e + (e >> 5)];
+    }
+    {  // t = 16
+        const uint2 t = tw2(w, ws, 2048 + 8 * R + (lane >> 2));
+        ct_pair<W, L>(x, 2, (lane & 2) == 0, t.x, t.y, p, p2, p8, 12);
+    }
+    {  // t = 8
+        const uint2 t = tw2(w, ws, 4096 + 16 * R + (lane >> 1));
+        ct_pair<W, L>(x, 1, (lane & 1) == 0, t.x, t.y, p, p2, p8, 13);
+    }
+    auto ct_uv = [&](W& a_, W& b_, uint2 u, W v, W vs, int S) { ct_t<W, L>(a_, b_, mul_uv<W, L>(b_, u.x, u.y, v, vs, p), p, p2, p8, S); };
+    {  // t = 4: U V
+        const uint2 u = tw2(w, ws, 8192 + 32 * R), v = tw2(w, ws, lane);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) ct_uv(x[k], x[k + 4], u, v.x, v.y, 14);
+    }
+    {  // t = 2
+        const uint2 u = tw2(w, ws, 16384 + 64 * R);
+        const uint4 v = tw4(w, ws, 2 * lane);
+        ct_uv(x[0], x[2], u, v.x, v.y, 15);
+        ct_uv(x[1], x[3], u, v.x, v.y, 15);
+        ct_uv(x[4], x[6], u, v.z, v.w, 15);
+        ct_uv(x[5], x[7], u, v.z, v.w, 15);
+    }
+    {  // t = 1
+        const uint2 u = tw2(w, ws, 32768 + 128 * R);
+        const uint4 va = tw4(w, ws, 4 * lane), vb = tw4(w, ws, 4 * lane + 2);
+        ct_uv(x[0], x[1], u, va.x, va.y, 16);
+        ct_uv(x[2], x[3], u, va.z, va.w, 16);
+        ct_uv(x[4], x[5], u, vb.x, vb.y, 16);
+        ct_uv(x[6], x[7], u, vb.z, vb.w, 16);
+    }
+#pragma unroll
+    for (int u = 0; u < 8; ++u) x[u] = canon_sub<L>(x[u], p, p2, p4, p8);
+    if (T.epi) {
+        const size_t r = (size_t)T.roff[row] * N + R * 256 + 8 * lane;
+        const W sc = ((const W*)T.es)[pid], scs = ((const W*)T.ess)[pid];
+        epi4<W>(T, r, x, sc, scs, p);
+        epi4<W>(T, r + 4, x + 4, sc, scs, p);
+        return;
+    }
+    store4<W>(boff(a, (8 * lane) << 2), x[0], x[1], x[2], x[3]);
+    store4<W>(boff(a, (8 * lane + 4) << 2), x[4], x[5], x[6], x[7]);
+}
+
+template <int L>
+__global__ void __launch_bounds__(32 * ROWS_D, 10) ntt_inv_rows_d(NttArgs T) {
+    using W = uint32_t;
+    __shared__ W s[ROWS_D][256 + 8];
+    pdl_trigger();
+    const int row = blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+    const uint32_t R = blockIdx.x * ROWS_D + wp;
+    W* const a = (W*)T.base + (size_t)T.roff[row] * N + R * 256;
+    const W* const in = T.soff ? (const W*)T.src + (size_t)T.soff[row] * N + R * 256 : a;
+    const int pid = T.rprime[row];
+    const W p = (W)T.pr[pid].p;
+    const W p2 = kp<W>(p, 2);
+    const W* const w = (const W*)T.iw + (size_t)pid * N;
+    const W* const ws = (const W*)T.iws + (size_t)pid * N;
+    W x[8];
+    {
+        const V4<W> v0 = load4_sum<W>(in + 8 * lane, T.snum, T.sstride, p), v1 = load4_sum<W>(in + 8 * lane + 4, T.snum, T.sstride, p);
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            x[u] = v0.v[u];
+            x[4 + u] = v1.v[u];
+        }
+    }
+    auto gs_uv = [&](W& a_, W& b_, uint2 u, W v, W vs) {
+        const W x0 = a_, x1 = b_;
+        a_ = gs_sum<W, L>(x0, x1, p, p2);
+        b_ = mul_uv<W, L>(gs_dif<W, L>(x0, x1, p, p2), u.x, u.y, v, vs, p);
+    };
+    {  // t = 1
+        const uint2 u = tw2(w, ws, 32768 + 128 * R);
+        const uint4 va = tw4(w, ws, 4 * lane), vb = tw4(w, ws, 4 * lane + 2);
+        gs_uv(x[0], x[1], u, va.x, va.y);
+        gs_uv(x[2], x[3], u, va.z, va.w);
+        gs_uv(x[4], x[5], u, vb.x, vb.y);
+        gs_uv(x[6], x[7], u, vb.z, vb.w);
+    }
+    {  // t = 2
+        const uint2 u = tw2(w, ws, 16384 + 64 * R);
+        const uint4 v = tw4(w, ws, 2 * lane);
+        gs_uv(x[0], x[2], u, v.x, v.y);
+        gs_uv(x[1], x[3], u, v.x, v.y);
+        gs_uv(x[4], x[6], u, v.z, v.w);
+        gs_uv(x[5], x[7], u, v.z, v.w);
+    }
+    {  // t = 4
+        const uint2 u = tw2(w, ws, 8192 + 32 * R), v = tw2(w, ws, lane);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) gs_uv(x[k], x[k + 4], u, v.x, v.y);
+    }
+    {  // t = 8
+        const uint2 t = tw2(w, ws, 4096 + 16 * R + (lane >> 1));
+        gs_pair<W, L>(x, 1, (lane & 1) == 0, t.x, t.y, p, p2);
+    }
+    {  // t = 16
+        const uint2 t = tw2(w, ws, 2048 + 8 * R + (lane >> 2));
+        gs_pair<W, L>(x, 2, (lane & 2) == 0, t.x, t.y, p, p2);
+    }
+    W* const tb = s[wp];
+#pragma unroll
+    for (int u = 0; u < 8; ++u) {
+        const uint32_t e = 8 * lane + u;
+        tb[e + (e >> 5)] = x[u];
+    }
+    __syncwarp();
+#pragma unroll
+    for (int j = 0; j < 8; ++j) x[j] = tb[lane + 32 * j + ((lane + 32 * j) >> 5)];
+    {  // t = 32
+        const uint4 t0 = tw4(w, ws, 1024 + 4 * R), t1 = tw4(w, ws, 1026 + 4 * R);
+        gs_lz<W, L>(x[0], x[1], t0.x, t0.y, p, p2);
+        gs_lz<W, L>(x[2], x[3], t0.z, t0.w, p, p2);
+        gs_lz<W, L>(x[4], x[5], t1.x, t1.y, p, p2);
+        gs_lz<W, L>(x[6], x[7], t1.z, t1.w, p, p2);
+    }
+    {  // t = 64
+        const uint4 t = tw4(w, ws, 512 + 2 * R);
+        gs_lz<W, L>(x[0], x[2], t.x, t.y, p, p2);
+        gs_lz<W, L>(x[1], x[3], t.x, t.y, p, p2);
+        gs_lz<W, L>(x[4], x[6], t.z, t.w, p, p2);
+        gs_lz<W, L>(x[5], x[7], t.z, t.w, p, p2);
+    }
+    {  // t = 128
+        const uint2 t = tw2(w, ws, 256 + R);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) gs_lz<W, L>(x[j], x[j + 4], t.x, t.y, p, p2);
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) *boff(a, (lane + 32 * j) << 2) = x[j];
+}
+
+template <int L>
+__global__ void __launch_bounds__(256) ntt_inv_cols_d(NttArgs T) {
+    using W = uint32_t;
+    __shared__ W s[256 * 16];
+    __shared__ uint2 st[256];
+    pdl_trigger();
+    const int row = blockIdx.y;
+    const uint32_t c = threadIdx.x & 15, q = threadIdx.x >> 4;
+    const int pid = T.rprime[row];
+    st[threadIdx.x] = tw2((const W*)T.iw + (size_t)pid * N, (const W*)T.iws + (size_t)pid * N, threadIdx.x);
+    W* const a = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 16 + c;
+    const W p = (W)T.pr[pid].p;
+    const W p2 = kp<W>(p, 2);
+    const W ni = T.es ? ((const W*)T.es)[row] : ((const W*)T.ninv)[pid], nis = T.es ? ((const W*)T.ess)[row] : ((const W*)T.ninvs)[pid];
+    __shared__ uint2 swn;  // (w ni, companion) of the last stage's twiddle w = iw[1]
+    if (threadIdx.x == 0) swn = fold_scalar(((const W*)T.iw)[(size_t)pid * N + 1], ni, nis, p, T.pr[pid].mu_lo);
+    W x[16];
+    pdl_wait();
+#pragma unroll
+    for (int u = 0; u < 16; ++u) x[u] = *boff(a, ((16 * q + u) * 256) << 2);
+    __syncthreads();
+#pragma unroll
+    for (int sg = 3; sg >= 0; --sg) {  // m = 128..16
+        const int h = 8 >> sg, m = 16 << sg;
+#pragma unroll
+        for (int u = 0; u < 16; ++u)
+            if ((u & h) == 0) {
+                const uint2 t = st[m + (m >> 4) * q + u / (2 * h)];
+                gs_lz<W, L>(x[u], x[u + h], t.x, t.y, p, p2);
+            }
+    }
+#pragma unroll
+    for (int u = 0; u < 16; ++u) s[(16 * q + u) * 16 + c] = x[u];
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 16; ++j) x[j] = s[(q + 16 * j) * 16 + c];
+#pragma unroll
+    for (int sg = 3; sg >= 1; --sg) {  // m = 8..2
+        const int h = 8 >> sg, m = 1 << sg;
+#pragma unroll
+        for (int j = 0; j < 16; ++j)
+            if ((j & h) == 0) {
+                const uint2 t = st[m + j / (2 * h)];
+                gs_lz<W, L>(x[j], x[j + h], t.x, t.y, p, p2);
+            }
+    }
+    {  // m = 1 (one twiddle w for the block) with N^-1 (or the row scalar) folded: (u + v) ni, (u - v) (w ni)
+        const uint2 wn = swn;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const W u = x[j], v = x[j + 8];
+            x[j] = mul_shoup<W>(gs_sum<W, L>(u, v, p, p2), ni, nis, p);
+            x[j + 8] = mul_shoup<W>(gs_dif<W, L>(u, v, p, p2), wn.x, wn.y, p);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < 16; ++j) *boff(a, ((q + 16 * j) * 256) << 2) = x[j];
+}
+
+// ntt_fwd_cols8 / ntt_inv_cols8 at u32 with staged twiddles (pairs 1..255 in shared memory before the wait) and ALU
+// addressing: the short chunks' column passes, the same layouts and stages
+template <int L>
+__global__ void __launch_bounds__(256) ntt_fwd_cols8_d(NttArgs T) {
+    using W = uint32_t;
+    __shared__ W s[256 * 8];
+    __shared__ uint2 st[256];
+    pdl_trigger();
+    const int row = blockIdx.y;
+    const uint32_t c = threadIdx.x & 7, q = threadIdx.x >> 3, lo = q & 3, hi = q >> 2;
+    const int pid = T.rprime[row];
+    st[threadIdx.x] = tw2((const W*)T.fw + (size_t)pid * N, (const W*)T.fws + (size_t)pid * N, threadIdx.x);
+    W* const a = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 8 + c;
+    const W* const in = T.soff ? (const W*)T.src + (size_t)T.soff[row] * N + blockIdx.x * 8 + c : a;
+    const W p = (W)T.pr[pid].p;
+    const W p2 = kp<W>(p, 2);
+    const W p8 = L == 2 ? kp<W>(p, 8) : (W)0;
+    W x[8];
+    pdl_wait();
+#pragma unroll
+    for (int j = 0; j < 8; ++j) x[j] = *boff(in, ((q + 32 * j) * 256) << 2);
+    for (int m = 1; m < T.snum; ++m) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) x[j] = add<W>(x[j], in[m * T.sstride + (q + 32 * j) * 256], p);
+    }
+    __syncthreads();
+#pragma unroll
+    for (int sg = 0; sg < 3; ++sg) {  // m = 1, 2, 4
+        const int h = 4 >> sg, m = 1 << sg;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            if ((j & h) == 0) {
+                const uint2 t = st[m + j / (2 * h)];
+                ct_lz<W, L>(x[j], x[j + h], t.x, t.y, p, p2, p8, sg + 1);
+            }
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) s[(q + 32 * j) * 8 + c] = x[j];
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 8; ++j) x[j] = s[(lo + 4 * j + 32 * hi) * 8 + c];
+#pragma unroll
+    for (int sg = 0; sg < 3; ++sg) {  // m = 8, 16, 32
+        const int h = 4 >> sg, m = 8 << sg;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            if ((j & h) == 0) {
+                const uint2 t = st[m + (m >> 3) * hi + j / (2 * h)];
+                ct_lz<W, L>(x[j], x[j + h], t.x, t.y, p, p2, p8, sg + 4);
+            }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 8; ++j) s[(lo + 4 * j + 32 * hi) * 8 + c] = x[j];
+    __syncthreads();
+#pragma unroll
+    for (int u = 0; u < 8; ++u) x[u] = s[(8 * q + u) * 8 + c];
+#pragma unroll
+    for (int sg = 0; sg < 2; ++sg) {  // m = 64, 128
+        const int h = 2 >> sg, m = 64 << sg;
+#pragma unroll
+        for (int u = 0; u < 8; ++u)
+            if ((u & h) == 0) {
+                const uint2 t = st[m + (m >> 5) * q + u / (2 * h)];
+                ct_lz<W, L>(x[u], x[u + h], t.x, t.y, p, p2, p8, sg + 7);
+            }
+    }
+#pragma unroll
+    for (int u = 0; u < 8; ++u) *boff(a, ((8 * q + u) * 256) << 2) = x[u];
+}
+
+template <int L>
+__global__ void __launch_bounds__(256) ntt_inv_cols8_d(NttArgs T) {
+    using W = uint32_t;
+    __shared__ W s[256 * 8];
+    __shared__ uint2 st[256];
+    pdl_trigger();
+    const int row = blockIdx.y;
+    const uint32_t c = threadIdx.x & 7, q = threadIdx.x >> 3, lo = q & 3, hi = q >> 2;
+    const int pid = T.rprime[row];
+    st[threadIdx.x] = tw2((const W*)T.iw + (size_t)pid * N, (const W*)T.iws + (size_t)pid * N, threadIdx.x);
+    W* const a = (W*)T.base + (size_t)T.roff[row] * N + blockIdx.x * 8 + c;
+    const W p = (W)T.pr[pid].p;
+    const W p2 = kp<W>(p, 2);
+    const W ni = T.es ? ((const W*)T.es)[row] : ((const W*)T.ninv)[pid], nis = T.es ? ((const W*)T.ess)[row] : ((const W*)T.ninvs)[pid];
+    __shared__ uint2 swn;
+    if (threadIdx.x == 0) swn = fold_scalar(((const W*)T.iw)[(size_t)pid * N + 1], ni, nis, p, T.pr[pid].mu_lo);
+    W x[8];
+    pdl_wait();
+#pragma unroll
+    for (int u = 0; u < 8; ++u) x[u] = *boff(a, ((8 * q + u) * 256) << 2);
+    __syncthreads();
+#pragma unroll
+    for (int sg = 1; sg >= 0; --sg) {  // m = 128, 64
+        const int h = 2 >> sg, m = 64 << sg;
+#pragma unroll
+        for (int u = 0; u < 8; ++u)
+            if ((u & h) == 0) {
+                const uint2 t = st[m + (m >> 5) * q + u / (2 * h)];
+                gs_lz<W, L>(x[u], x[u + h], t.x, t.y, p, p2);
+            }
+    }
+#pragma unroll
+    for (int u = 0; u < 8; ++u) s[(8 * q + u) * 8 + c] = x[u];
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 8; ++j) x[j] = s[(lo + 4 * j + 32 * hi) * 8 + c];
+#pragma unroll
+    for (int sg = 2; sg >= 0; --sg) {  // m = 32, 16, 8
+        const int h = 4 >> sg, m = 8 << sg;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            if ((j & h) == 0) {
+                const uint2 t = st[m + (m >> 3) * hi + j / (2 * h)];
+                gs_lz<W, L>(x[j], x[j + h], t.x, t.y, p, p2);
+            }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 8; ++j) s[(lo + 4 * j + 32 * hi) * 8 + c] = x[j];
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 8; ++j) x[j] = s[(q + 32 * j) * 8 + c];
+#pragma unroll
+    for (int sg = 2; sg >= 1; --sg) {  // m = 4, 2
+        const int h = 4 >> sg, m = 1 << sg;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            if ((j & h) == 0) {
+                const uint2 t = st[m + j / (2 * h)];
+                gs_lz<W, L>(x[j], x[j + h], t.x, t.y, p, p2);
+            }
+    }
+    {  // m = 1 with N^-1 (or the row scalar) folded
+        const uint2 wn = swn;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const W u = x[j], v = x[j + 4];
+            x[j] = mul_shoup<W>(gs_sum<W, L>(u, v, p, p2), ni, nis, p);
+            x[j + 4] = mul_shoup<W>(gs_dif<W, L>(u, v, p, p2), wn.x, wn.y, p);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) *boff(a, ((q + 32 * j) * 256) << 2) = x[j];
+}
+
+// Chunks of at most this many rows run their column passes on 8-column blocks.
+constexpr int COLS8_MAX = 9;
+
+template <class W, int L>
+void fwd_chunk(const NttArgs& b, int m, cudaStream_t s) {
+    if constexpr (sizeof(W) == 4) {
+        if (m <= COLS8_MAX) launch_pdl(ntt_fwd_cols8_d<L>, dim3(32, m), s, b);
+        else launch_pdl(ntt_fwd_cols_d<L>, dim3(16, m), s, b);
+        launch_pdl_t(ntt_fwd_rows_d<L>, dim3(256 / ROWS_D, m), 32 * ROWS_D, s, b);
+    } else {
+        if (m <= COLS8_MAX) launch_pdl(ntt_fwd_cols8<W, L>, dim3(32, m), s, b);
+        else launch_pdl(ntt_fwd_cols<W, L>, dim3(16, m), s, b);
+        launch_pdl(ntt_fwd_rows<W, L>, dim3(32, m), s, b);
+    }
+}
+template <class W, int L>
+void inv_chunk(const NttArgs& b, int m, cudaStream_t s) {
+    if constexpr (sizeof(W) == 4) {
+        ntt_inv_rows_d<L><<<dim3(256 / ROWS_D, m), 32 * ROWS_D, 0, s>>>(b);
+        if (m <= COLS8_MAX) launch_pdl(ntt_inv_cols8_d<L>, dim3(32, m), s, b);
+        else launch_pdl(ntt_inv_cols_d<L>, dim3(16, m), s, b);
+    } else {
+        ntt_inv_rows<W, L><<<dim3(32, m), 256, 0, s>>>(b);
+        if (m <= COLS8_MAX) launch_pdl(ntt_inv_cols8<W, L>, dim3(32, m), s, b);
+        else launch_pdl(ntt_inv_cols<W, L>, dim3(16, m), s, b);
+    }
+}
+
+template <class W>
+int fwd(const NttArgs* a, cudaStream_t s) {
+    if (a->epi < 0 || a->epi > 3 || (a->epi && (!a->eout || !a->ex || !a->es || !a->ess))) return -1;
+    NttArgs b = *a;
+    b.snum = a->soff ? max(a->snum, 1) : 1;
+    b.xnum = max(a->xnum, 1);
+    const int lz = LAZY<W, 1> ? a->lazy : 0;
+    const int ch = a->chunk > 0 ? a->chunk : a->nrows;
+    for (int i = 0; i < a->nrows; i += ch) {
+        const int m = min(ch, a->nrows - i);
+        b.roff = a->roff + i;
+        b.rprime = a->rprime + i;
+        b.soff = a->soff ? a->soff + i : nullptr;
+        if (lz >= 2) fwd_chunk<W, 2>(b, m, s);
+        else if (lz) fwd_chunk<W, 1>(b, m, s);
+        else fwd_chunk<W, 0>(b, m, s);
+    }
+    return (int)cudaGetLastError();
+}
+template <class W>
+int inv(const NttArgs* a, cudaStream_t s) {
+    if (a->epi) return -1;  // the epilogues are forward-only
+    NttArgs b = *a;
+    b.snum = a->soff ? max(a->snum, 1) : 1;
+    const int lz = LAZY<W, 1> ? a->lazy : 0;
+    const int ch = a->chunk > 0 ? a->chunk : a->nrows;
+    for (int i = 0; i < a->nrows; i += ch) {
+        const int m = min(ch, a->nrows - i);
+        b.roff = a->roff + i;
+        b.rprime = a->rprime + i;
+        b.soff = a->soff ? a->soff + i : nullptr;
+        b.es = a->es ? (const W*)a->es + i : nullptr;
+        b.ess = a->es ? (const W*)a->ess + i : nullptr;
+        if (lz) inv_chunk<W, 1>(b, m, s);  // the inverse is the same at L = 2
+        else inv_chunk<W, 0>(b, m, s);
+    }
+    return (int)cudaGetLastError();
+}
+}  // namespace ntt
+}  // namespace pc

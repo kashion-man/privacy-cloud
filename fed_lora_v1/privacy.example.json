@@ -1,0 +1,7 @@
+{
+  "dp": false,
+  "mpc": false,
+  "clip_norm": 1.0,
+  "noise_multiplier": 4.0,
+  "delta": 0.00001
+}

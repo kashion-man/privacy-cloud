@@ -1,0 +1,608 @@
+"""Channel-blocked prefill: the hidden over K ciphertexts of nch channels, each holding whole heads."""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import numpy as np
+
+from .layout import Dims, lanes_mask, lanes_periodic, ladder_chunks
+from .poly import eval_chebyshev, eval_chebyshev_masked, im_cleanse, inv_sqrt_newton_d2, rotsum
+from . import prefill
+from .prefill import Chunks, join, prefill_attention
+
+
+@dataclass(frozen=True)
+class Blocks:
+    """K = hid / nch channel blocks of the model dims `d`; group k holds heads [k H', (k + 1) H')."""
+    d: Dims
+    nch: int = 512
+    G: int = 1                  # query heads per KV head: K / V blocks hold each KV head once
+
+    def __post_init__(self):
+        if self.d.hid % self.nch or self.nch % self.d.d_head or self.t > self.d.d_head:
+            raise ValueError("Blocks: nch must split hid into whole heads, with t <= d_head (score ct coverage)")
+        if self.G > 1 and (self.K % self.G or self.d.H_real != self.d.H):
+            raise ValueError("Blocks: GQA needs whole KV blocks and no padded heads")
+
+    @property
+    def K(self): return self.d.hid // self.nch
+    @property
+    def t(self): return self.d.N // self.nch
+    @property
+    def hg(self): return self.nch // self.d.d_head          # heads per block
+    @property
+    def Kkv(self): return self.K // self.G                  # K / V blocks; Q block q reads K / V block q % Kkv
+
+    def real(self, k):
+        return int(min(max(self.d.dim - k * self.nch, 0), self.nch))
+
+    def group_dims(self, k):
+        """The head group's own geometry (t lanes, H' heads)."""
+        hr = int(min(max(self.d.H_real - k * self.hg, 0), self.hg))
+        return Dims(self.d.N, self.nch, self.d.d_head_real * hr, self.hg, hr, self.d.N, self.d.N)
+
+    def head_perm(self):
+        """Head-grouped index of interleaved feature r = j H + h: block (h % G) Kkv + kv // H', local j H' + kv % H'."""
+        r = np.arange(self.d.hid)
+        H, hg = self.d.H, self.hg
+        j, h = r // H, r % H
+        kv, g = h // self.G, h % self.G
+        return (g * self.Kkv + kv // hg) * self.nch + j * hg + (kv % hg)
+
+    def kv_perm(self):
+        """(source column, index in the K / V blocks) of each KV head once."""
+        r = np.arange(self.d.hid)
+        h = r % self.d.H
+        keep = h % self.G == 0
+        return r[keep], self.head_perm()[keep]
+
+    def kv_cols(self, W):
+        src, dst = self.kv_perm()
+        out = np.zeros((W.shape[0], self.Kkv * self.nch), W.dtype)
+        out[:, dst] = W[:, src]
+        return out
+
+    def kv_vec(self, v):
+        src, dst = self.kv_perm()
+        out = np.zeros(self.Kkv * self.nch, np.asarray(v).dtype)
+        out[dst] = np.asarray(v)[src]
+        return out
+
+    def group_cols(self, W):
+        out = np.zeros_like(W)
+        out[:, self.head_perm()] = W
+        return out
+
+    def group_rows(self, W):
+        out = np.zeros_like(W)
+        out[self.head_perm(), :] = W
+        return out
+
+    def group_vec(self, v):
+        out = np.zeros_like(v)
+        out[self.head_perm()] = v
+        return out
+
+
+class SubRt:
+    """rt with the dims of one head group; mask keys namespaced by those dims (their masks differ)."""
+
+    def __init__(self, rt, dims, tag):
+        self._rt, self.dims, self._tag = rt, dims, tag
+        rt.sub_tags = frozenset(rt.sub_tags) | {tag}    # its masks keep their own sites (Rt.site)
+
+    def __getattr__(self, name):
+        return getattr(self._rt, name)
+
+    def _key(self, key):
+        return (self._tag,) + (key if isinstance(key, tuple) else (key,))
+
+    def mask(self, key, build):
+        return self._rt.mask(self._key(key), build)
+
+    def mult_mask(self, ct, key, build):
+        return self._rt.mult_mask(ct, self._key(key), build)
+
+    def add_mask(self, ct, key, build):
+        return self._rt.add_mask(ct, self._key(key), build)
+
+    def mult_masks(self, ct, keys, builds):
+        return self._rt.mult_masks(ct, [self._key(k) for k in keys], builds)
+
+
+def sub_rt(rt, B: Blocks, k: int):
+    g = B.group_dims(k)
+    return SubRt(rt, g, f"hg{g.H}.{g.H_real}.{g.t}")
+
+
+# ── prompt in / out ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+def blocked_slots(rows, ch: Chunks, B: Blocks):
+    """encode_blocked's slot vectors, [g][k]."""
+    N, t = B.d.N, B.t
+    rows = np.asarray(rows, dtype=np.float64)
+    full = np.zeros((rows.shape[0], B.d.hid))
+    full[:, :rows.shape[1]] = rows
+    idx = np.arange(B.nch) * t
+    out = []
+    for g in range(ch.n_ct):
+        blk = []
+        for k in range(B.K):
+            v = np.zeros(N, dtype=np.complex128)
+            for half in (0, 1):
+                if ch.has(2 * g + half):
+                    for lane, p in enumerate(ch.idx(2 * g + half)):
+                        v[idx + lane] += (1j if half else 1.0) * full[p, k * B.nch:(k + 1) * B.nch]
+            blk.append(v)
+        out.append(blk)
+    return out
+
+
+def encode_blocked(rt, rows, ch: Chunks, B: Blocks):
+    """Xs[g][k]: chunk pair g (2g real, 2g + 1 imaginary), channel block k (feature k nch + r at slot r t + lane)."""
+    ops = rt.ops
+    out = []
+    for blk in blocked_slots(rows, ch, B):
+        row = []
+        for v in blk:
+            zero = ops.core.encode_token_input(ops.inf, np.zeros(B.d.dim))
+            row.append(ops.add_pt(zero, v))
+        out.append(row)
+    return out
+
+
+def decrypt_blocked(rt, Xs, ch: Chunks, B: Blocks, d_real: int):
+    ops = rt.ops
+    rows = np.zeros((ch.T, B.d.hid))
+    idx = np.arange(B.nch) * B.t
+    for g, blk in enumerate(Xs):
+        for k, X in enumerate(blk):
+            v = ops.decrypt_slots_complex(X)
+            for half, part in ((0, v.real), (1, v.imag)):
+                for lane, p in enumerate(ch.idx(2 * g + half)):
+                    rows[p, k * B.nch:(k + 1) * B.nch] = part[idx + lane]
+    return rows[:, :d_real]
+
+
+def token_of(rt, Xs, ch: Chunks, B: Blocks, p: int):
+    """Position p of Xs[g][k] as one decode-layout token row (feature i at slot i d.t, real): its lane and axis are
+    masked out and aligned, then each block's stride shrinks from B.t to d.t by one masked rotation per bit of the
+    feature index (bit j moves its features (B.t - d.t) 2^j slots down), and block k is moved to feature k nch."""
+    ops, d = rt.ops, B.d
+    c = p // ch.t
+    g, half, lane = c // 2, c % 2, p - c * ch.t
+    out = None
+    for k in range(B.K):
+        n = B.real(k)
+        if n == 0:
+            continue
+        r = np.arange(n)
+        pos = r * B.t
+
+        def at(slots):
+            v = np.zeros(d.N)
+            v[slots] = 1.0
+            return v
+        # w + conj(w) is the axis of chunk c: Re(x) for w = x/2, Im(x) for w = -i x/2
+        w = rt.mult_mask(Xs[g][k], ("tok_of", B.nch, k, "sel", lane, half),
+                         lambda: (-0.5 if half else 0.5) * at(pos + lane))
+        w = ops.rotate(ops.mult_i(w) if half else w, lane)
+        for j in range(max(1, int(n - 1).bit_length())):
+            moved = (r >> j) & 1 == 1
+            step = (B.t - d.t) << j
+            keep = rt.mult_mask(w, ("tok_of", B.nch, k, "bit", j, 0), lambda: at(pos[~moved]))
+            move = rt.mult_mask(w, ("tok_of", B.nch, k, "bit", j, 1), lambda: at(pos[moved]))
+            w = ops.add(keep, ops.rotate(move, step))
+            pos = np.where(moved, pos - step, pos)
+        if k:
+            w = ops.rotate(w, (-k * B.nch * d.t) % d.N)
+        out = w if out is None else ops.add(out, w)
+    return ops.add(out, ops.conjugate(out))
+
+
+def token_of_rot_steps(B: Blocks, lane: int) -> set[int]:
+    """The rotation steps token_of takes for a position on `lane`."""
+    d = B.d
+    steps = {lane} | {-k * B.nch * d.t for k in range(1, B.K)}
+    steps |= {(B.t - d.t) << j for j in range(max(1, int(B.nch - 1).bit_length()))}
+    return {s % d.N for s in steps if s % d.N}
+
+
+def name_blocked(inf, Xs):
+    """Name every input after the first (anon numbering differs between a capture and its planned run)."""
+    if hasattr(inf, "name_ct"):
+        flat = [x for blk in Xs for x in blk]
+        for c, X in enumerate(flat[1:], 1):
+            inf.name_ct(X, f"pf_in{c}")
+
+
+# ── norms ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+def _region(N, t, R, k, val):
+    return np.where((np.arange(N) // t) % R == k, val, 0.0)
+
+
+def norm_blocked(rt, Xs, cfg, ch: Chunks, B: Blocks, rms: bool = False, max_period: int = 512):
+    """norm_all for Xs[g][k]: 2 (LN(A) + i LN(B)) per block, statistic summed over the K blocks."""
+    ops, N, t, dr = rt.ops, B.d.N, B.t, B.d.dim
+    # zladder (LayerNorm only): one complex ladder for the mean and the variance instead of two
+    zl = not rms and bool(getattr(cfg, "zladder", 0)) and bool(cfg.cheb_coeffs) and ops.ln_cheb
+    alpha = 0.5 / dr
+    halves = []                              # (g, half, lane scales, [x_k], statistic)
+    for g, blk in enumerate(Xs):
+        for half in (0, 1):
+            if not ch.has(2 * g + half):
+                continue
+            pos = ch.lanes(2 * g + half)
+            cs = tuple(round(math.sqrt(cfg.c_eff_sq(p)), 12) for p in pos)
+            xs = []
+            for k, X in enumerate(blk):
+                if B.real(k) == 0:
+                    xs.append(None)
+                    continue
+                x2 = im_cleanse(ops, X if half == 0 else ops.mult_i(X))
+                xs.append(rt.mult_mask(x2, ("bl.center", k, cs),
+                                       lambda k=k, cs=cs: lanes_mask(N, B.real(k), t, [0.5 * c_ for c_ in cs])))
+            live = [x for x in xs if x is not None]
+            if rms:
+                sq = None
+                for x in live:
+                    s2 = ops.square(x)
+                    sq = s2 if sq is None else ops.add(sq, s2)
+                S = ops.tag_reduce(rotsum(ops, sq, t, N), t)
+                halves.append((g, half, cs, xs, S))
+            elif zl:
+                # the sum and the sum of squares on ONE ladder: z = S1 / (2 dr) + i S2, split by one conjugation into
+                # re = S1 / dr = the mean and im = 2 S2, so var = im / (2 dr) - re^2 at the two-pass variance's level.
+                # The centring subtracts re unmasked (no level: the norm's output stays at the two-pass level; the
+                # padded channels carry -mean, which the next linear's zero rows or the affine's zero gamma drop)
+                tot, sq = None, None
+                for x in live:
+                    tot = x if tot is None else ops.add(tot, x)
+                    s2 = ops.square(x)
+                    sq = s2 if sq is None else ops.add(sq, s2)
+                z = ops.tag_reduce(rotsum(ops, ops.add(ops.mult(tot, alpha), ops.mult_i(sq)), t, N), t)
+                zc = ops.conjugate(z)
+                re = ops.add(z, zc)
+                u = ops.sub(ops.mult(ops.mult_i(ops.sub(zc, z)), alpha), ops.square(re))
+                halves.append((g, half, cs, [None if x is None else ops.sub(x, re) for x in xs], u))
+            else:
+                tot = live[0]
+                for x in live[1:]:
+                    tot = ops.add(tot, x)
+                mean = ops.tag_reduce(rotsum(ops, tot, t, N), t)
+                cen, sq = [], None
+                for k, x in enumerate(xs):
+                    if x is None:
+                        cen.append(None)
+                        continue
+                    mk = rt.mult_mask(mean, ("bl.mean", k, len(cs)),
+                                      lambda k=k, n=len(cs): lanes_mask(N, B.real(k), t, [-1.0 / dr] * n))
+                    c_ = ops.add(x, mk)
+                    cen.append(c_)
+                    s2 = ops.square(c_)
+                    sq = s2 if sq is None else ops.add(sq, s2)
+                var = ops.tag_reduce(rotsum(ops, sq, t, N), t)
+                halves.append((g, half, cs, cen, var))
+    per = max(1, max_period // t)
+    outs = {}
+    for g0 in range(0, len(halves), per):
+        grp = halves[g0:g0 + per]
+        R = 1 << (len(grp) - 1).bit_length()
+        V = None
+        eps = np.zeros(N)
+        mid = (dr if rms else 1.0) * 0.5 * (cfg.cheb_lo + cfg.cheb_hi) if cfg.cheb_coeffs else 1.0
+        for k, (_g, _h, cs, _x, st) in enumerate(grp):
+            sc = 1.0 if rms or zl else 1.0 / dr
+            m = rt.mult_mask(st, ("bl.nreg", R, k, sc), lambda R=R, k=k, sc=sc: _region(N, t, R, k, sc))
+            V = m if V is None else ops.add(V, m)
+            e = [(dr if rms else 1.0) * cfg.epsilon * c_ * c_ for c_ in cs]
+            eps += np.where((np.arange(N) // t) % R == k, lanes_periodic(N, t, e, mid), 0.0)
+        for k in range(len(grp), R):
+            eps += _region(N, t, R, k, mid)
+        V = rt.add_mask(V, ("bl.neps", rms, R, tuple(x[2] for x in grp), cfg.epsilon), lambda eps=eps: eps)
+        V = ops.tag_reduce(V, R * t)
+        lo, hi = (dr * cfg.cheb_lo, dr * cfg.cheb_hi) if rms else (cfg.cheb_lo, cfg.cheb_hi)
+        if not (cfg.cheb_coeffs and ops.ln_cheb):
+            raise ValueError("norm_blocked: needs the Chebyshev inverse-sqrt seed (LN_CHEB=1, cheb_* config)")
+        init = eval_chebyshev(ops, V, cfg.cheb_coeffs, lo, hi)
+        xsc = 1.0 / ((dr if rms else 1.0) * cfg.inv_out_scale * cfg.inv_out_scale)
+        inv = inv_sqrt_newton_d2(ops, V, init, cfg.cheb_nr_iters, xsc)
+        ops.bootstrap_hint(inv, ops.headroom(4))
+        for k, (g, half, _cs, xs, _st) in enumerate(grp):
+            ik = rt.mult_mask(inv, ("bl.nreg", R, k, 1.0), lambda R=R, k=k: _region(N, t, R, k, 1.0))
+            if R > 1:
+                ik = ops.rotate_and_sum(ik, t, R * t)
+            outs[(g, half)] = [None if x is None else im_cleanse(ops, ops.mult(x, ik)) for x in xs]
+    res = []
+    for g, blk in enumerate(Xs):
+        row = []
+        for k in range(len(blk)):
+            a = outs[(g, 0)][k]
+            if a is None:
+                row.append(ops.sub(blk[k], blk[k]))
+                continue
+            row.append(a if (g, 1) not in outs else join(ops, a, ops.negate(outs[(g, 1)][k])))
+        res.append(row)
+    return res
+
+
+def shift_blocked(rt, X2, shift, ch: Chunks, g: int, k: int, B: Blocks, scale: float = 1.0):
+    """X2 + scale (shift + i shift) of block k on every filled lane (the folded LayerNorm shift)."""
+    N, t = B.d.N, B.t
+    na = len(ch.lanes(2 * g))
+    nb = len(ch.lanes(2 * g + 1)) if ch.has(2 * g + 1) else 0
+    sh = np.zeros(B.d.hid)
+    s0 = np.asarray(shift, dtype=np.float64).ravel()[:B.d.dim]
+    sh[:s0.shape[0]] = s0
+    sk = sh[k * B.nch:(k + 1) * B.nch]
+    if not np.any(sk):
+        return X2
+
+    def build():
+        out = np.zeros(N, dtype=np.complex128)
+        idx = np.arange(B.nch) * t
+        for lane in range(t):
+            out[idx + lane] = scale * sk * ((1.0 if lane < na else 0.0) + (1j if lane < nb else 0.0))
+        return out
+    return rt.add_mask(X2, ("bl.shift", id(shift), k, na, nb, scale), build)
+
+
+def attention_blocked(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, rope=None, prefixes=None, kv=None, layer=0):
+    """prefill_attention per head group: O[g][k]; GQA K / V block b serves query blocks b, Kkv + b, ...
+    `kv`: a list receiving each K / V block's per-chunk real K (post-RoPE) / V (GQA only).
+    PF_ATTN=ccmm: the CCMM path (ccmm_attn.py)."""
+    from . import ccmm
+    if ccmm.enabled():
+        from .ccmm_attn import attention_ccmm
+        if kv is None:
+            kv = [dict() for _ in range(B.Kkv)]
+        return attention_ccmm(rt, Q, K, V, cfg, ch, B, rope=rope, prefixes=prefixes, kv=kv, layer=layer)
+    if B.G > 1:
+        outs = [[None] * B.K for _ in Q]
+        for b in range(B.Kkv):
+            qs = [b + g * B.Kkv for g in range(B.G)]
+            pre = prefixes[b] if prefixes is not None else None
+            o = prefill_attention(sub_rt(rt, B, b), [[q[i] for q in Q] for i in qs], [x[b] for x in K],
+                                  [x[b] for x in V], cfg, ch, rope=rope, prefix=pre, shared=True,
+                                  kv=None if kv is None else kv[b])
+            for i, oi in zip(qs, o):
+                for g in range(len(Q)):
+                    outs[g][i] = oi[g]
+        return outs
+    outs = []
+    for k in range(B.K):
+        if B.group_dims(k).H_real == 0:
+            outs.append([None] * len(Q))
+            continue
+        pre = prefixes[k] if prefixes is not None else None
+        outs.append(prefill_attention(sub_rt(rt, B, k), [q[k] for q in Q], [x[k] for x in K], [x[k] for x in V],
+                                      cfg, ch, rope=rope, prefix=pre))
+    ops = rt.ops
+    res = []
+    for g in range(len(Q)):
+        row = []
+        for k in range(B.K):
+            o = outs[k][g]
+            row.append(o if o is not None else ops.sub(Q[g][k], Q[g][k]))
+        res.append(row)
+    return res
+
+
+# ── one position alone: a block whose other positions feed nothing (the last token before the tail, an encoder's
+# [CLS]) ──
+
+def _query_lane(ch: Chunks, B: Blocks, p: int):
+    """(half, lane) of position p, which must sit in chunk pair 0 (the last position of a causal prompt: its only
+    chunk pair)."""
+    c = p // ch.t
+    lane = p - c * ch.t
+    if (ch.n_ct != 1 and not ch.bidir) or c // 2:
+        raise ValueError(f"one-position block: position {p} must sit in the first chunk pair")
+    return c % 2, lane
+
+
+def _spread(ops, x, lane: int, t: int):
+    """Lane `lane` of every t-lane group on all of the group's lanes (another than the first or the last moves to the
+    last first: one rotation)."""
+    if lane not in (0, t - 1):
+        x = ops.rotate(x, lane - (t - 1))
+        lane = t - 1
+    return rotsum(ops, x, -1 if lane == 0 else 1, t)
+
+
+def token_bcast(rt, row, ch: Chunks, B: Blocks, p: int):
+    """Position p of the blocked row (chunk pair 0) on every lane of both halves: one level."""
+    ops, N = rt.ops, B.d.N
+    half, lane = _query_lane(ch, B, p)
+    out = []
+    for k, x in enumerate(row):
+        sel = np.where(np.arange(N) % B.t == lane, -0.5j if half else 0.5, 0.0)
+        w = im_cleanse(ops, rt.mult_mask(x, ("bl.tok", B.nch, half, lane), lambda sel=sel: sel))
+        w = _spread(ops, w, lane, B.t)
+        out.append(ops.add(w, ops.mult_i(w)))
+    return out
+
+
+def attention_last(rt, Q, K, V, cfg, ch: Chunks, B: Blocks, p: int, rope=None, prefixes=None, kv=None):
+    """attention_blocked for query position p alone (the last of a causal prompt, any of a bidirectional one: its keys
+    are every unpadded token): O[0][k] holds p's output on every lane of both halves. Per head group k, q_p on every
+    lane times the complex K of chunk pair g (keys of chunk 2g real, chunk 2g + 1 imaginary) is summed over the head
+    dimension; the groups' scores share one score ciphertext, keys of chunk c of group k on the blocks of class c K + k
+    (period 2 G K tH over the G chunk pairs), so one softmax serves every head; its key sums run over the chunks and the
+    lanes and return to every lane from the first. P.V pairs each chunk pair's halves as P_2g - i P_2g+1 against V.
+    GQA (B.G > 1): query block k reads K / V block k % Kkv. `rope`: K's chunks and q_p take RoPE at their positions;
+    `prefixes`: per K / V block, the public (key, value) slot vectors before the prompt, put on the first padding lane;
+    `kv`: per K / V block, a dict receiving the per-chunk real K (post-RoPE) / V, as prefill_attention's."""
+    from . import smcheb
+    from .attention import _recip_rounds, sink_only
+    from .prefill import _KcExtrapolated, recip_lanes, rope_lanes, split
+    sink_only(cfg, "attention_last")
+    centred = bool(cfg.ref_keys)
+    ops, N, t = rt.ops, B.d.N, B.t
+    half, lane = _query_lane(ch, B, p)
+    G = len(Q)
+    if G != ch.n_ct or (not ch.bidir and p != ch.T - 1):
+        raise ValueError("attention_last: one row per chunk pair, the last position of a causal prompt")
+    kvb = lambda k: k % B.Kkv                                       # noqa: E731  the K / V block of query block k
+    kscale = 1.0
+    if rope is not None or kv is not None:
+        # K's real chunks (post-RoPE) at scale 1, back to one complex ciphertext per chunk pair
+        Kr = [[None] * B.Kkv for _ in range(G)]
+        for b in range(B.Kkv):
+            sub = sub_rt(rt, B, b)
+            ks_, vs_ = [], []
+            for g in range(G):
+                A, Bh = split(ops, K[g][b])
+                if rope is not None:
+                    A = rope_lanes(sub, A, rope, ch.lanes(2 * g), "pf.rope.k")
+                    Bh = rope_lanes(sub, Bh, rope, ch.lanes(2 * g + 1), "pf.rope.k") if ch.has(2 * g + 1) else Bh
+                ks_ += [A, Bh] if ch.has(2 * g + 1) else [A]
+                Kr[g][b] = A if not ch.has(2 * g + 1) else ops.add(A, ops.mult_i(Bh))
+                if kv is not None:
+                    va, vb = split(ops, V[g][b])
+                    vs_ += [va, vb] if ch.has(2 * g + 1) else [va]
+            if kv is not None:
+                kv[b]["K"], kv[b]["V"] = ks_, vs_
+        K, kscale = Kr, 0.5
+    if centred and prefixes is None:
+        # key 0 encrypted (GPT-2, ViT): its K (chunk 0's lane 0, the real part of chunk pair 0) copied over every lane
+        # (replicate-right ladder) and taken off every chunk pair, real and imaginary: the scores come out as s - s_0
+        from .poly import rotsum_neg
+        K = [list(r) for r in K]
+        for b in range(B.Kkv):
+            k0 = rt.mult_mask(ops.add(K[0][b], ops.conjugate(K[0][b])), ("bl.last.kref0", B.nch, b, t),
+                              lambda: 0.5 * (np.arange(N) % t == 0))
+            k0 = rotsum_neg(ops, k0, t)
+            for g in range(G):
+                K[g][b] = ops.sub(K[g][b], ops.add(k0, ops.mult_i(k0)) if ch.has(2 * g + 1) else k0)
+    n_pre = 0
+    if prefixes is not None:
+        # the public key / value on key index T (the first padding lane), in its chunk's half
+        cp, lp = divmod(ch.T, t)
+        if cp >= 2 * G:
+            raise ValueError("attention_last: a prefix key needs a padding lane in the prompt's chunk pairs")
+        gp, ph = divmod(cp, 2)
+        at = np.arange(N) % t == lp
+        K, V = [list(r) for r in K], [list(r) for r in V]
+        for b in range(B.Kkv):
+            kvec, vvec = (np.asarray(x) for x in prefixes[b])
+            sk = 1.0 if kscale == 0.5 else 0.5
+            if centred:
+                # a softmax centred on key 0: every prompt key minus the public key (chunk 2g real, 2g + 1 imaginary,
+                # on its token lanes), the prefix lane left 0, so the scores come out as s - s_pre (a plaintext sum)
+                for g in range(G):
+                    def build(g=g, kvec=kvec):
+                        out = np.zeros(N, dtype=complex)
+                        for unit, c in ((1.0, 2 * g), (1j, 2 * g + 1)):
+                            if ch.has(c):
+                                out += np.where(np.arange(N) % t < len(ch.lanes(c)), -unit * sk * kvec, 0.0)
+                        return out
+                    K[g][b] = rt.add_mask(K[g][b], ("bl.last.ref.k", B.nch, b, ch.T, kscale, g), build)
+            else:
+                ck = (1j if ph else 1.0) * sk
+                K[gp][b] = rt.add_mask(K[gp][b], ("bl.last.pre.k", B.nch, b, ch.T, kscale),
+                                       lambda kvec=kvec, ck=ck: np.where(at, ck * kvec, 0.0))
+            V[gp][b] = rt.add_mask(V[gp][b], ("bl.last.pre.v", B.nch, b, ch.T),
+                                   lambda vvec=vvec, ph=ph: np.where(at, (0.5j if ph else 0.5) * vvec, 0.0))
+        n_pre = 1
+    ks = [k for k in range(B.K) if B.group_dims(k).H_real]
+    gd = B.group_dims(0)
+    tH, R = gd.tH, 2 * G * B.K
+    if (N // tH) % R:
+        raise ValueError(f"attention_last: {2 * G} chunks x {B.K} groups do not tile the {N // tH} score blocks")
+    pair = (lambda g: (("pair", g, G),)) if G > 1 else (lambda g: ())
+    cls = (np.arange(N) // tH) % R
+    head = (np.arange(N) % tH) // t
+    valid = head < np.array([B.group_dims(r % B.K).H_real for r in range(R)])[cls]
+    kc = (ch.n_keys if ch.bidir else p + 1) + n_pre
+    valid &= (cls // B.K) * t + np.arange(N) % t < kc              # the key on each lane: chunk h, lane i
+    gscale = 1.0 / math.sqrt(gd.d_head_real)
+    T = None
+    for k in ks:
+        sel = np.where(np.arange(N) % t == lane, -1j if half else 1.0, 0.0)
+        q = im_cleanse(ops, rt.mult_mask(Q[0][k], ("bl.last.q", B.nch, half, lane), lambda sel=sel: sel))
+        q = _spread(ops, q, lane, t)                                # q_p on every lane: real, scale 1
+        if rope is not None:
+            q = rope_lanes(sub_rt(rt, B, k), q, rope, [ch.base + p] * t, "bl.last.rope.q")
+        for g in range(G):
+            s = rotsum(ops, ops.mult(q, K[g][kvb(k)]), tH, N)        # (s_2g + i s_2g+1) / 2 on every block
+            c0, c1 = 2 * g * B.K + k, (2 * g + 1) * B.K + k
+            gs = gscale * kscale
+            m = np.where(cls == c0, gs, 0.0) + np.where(cls == c1, -1j * gs, 0.0)
+            s = rt.mult_mask(s, ("bl.last.s", B.nch, k, gs) + pair(g), lambda m=m: m)
+            T = s if T is None else ops.add(T, s)
+    S = im_cleanse(ops, T)                                         # scores of chunk c of group k on class c K + k
+    mean = (cfg.clip_hi + cfg.clip_lo) / 2.0
+    sf = 2.0 ** (-cfg.log2delta1 - cfg.log2delta2)
+    skey = ("bl.last.score", B.nch, cfg.clip_lo, mean) + ((("keys", kc),) if ch.bidir else ()) + ((G,) if G > 1 else ())
+    S = rt.add_mask(S, skey, lambda: np.where(valid, -mean, cfg.clip_lo - mean))
+    gk = (G,) if G > 1 else ()
+    if cfg.exp_mask_fold:       # the active mask's root rides the series (prefill._sm_cheb)
+        pw = 2 ** cfg.log2delta1
+        root = lambda sc: (lambda: np.where(valid, sc * (0.5 / kc) ** (1.0 / pw), 0.0))
+        z = eval_chebyshev_masked(ops, S, cfg.cheb_coeffs, cfg.cheb_a / sf, cfg.cheb_b / sf, None,
+                                  lambda ct, sc: rt.mult_mask(ct, ("bl.last.active", B.nch, kc, "fold", pw, sc) + gk, root(sc)),
+                                  lambda ct, sc: rt.add_mask(ct, ("bl.last.active", B.nch, kc, "fold+", pw, sc) + gk, root(sc)))
+        for _ in range(cfg.log2delta1):
+            z = ops.square(z)
+        Z = im_cleanse(ops, z)
+    else:
+        z = eval_chebyshev(ops, S, cfg.cheb_coeffs, cfg.cheb_a / sf, cfg.cheb_b / sf)
+        for _ in range(cfg.log2delta1):
+            z = ops.square(z)
+        Z = rt.mult_mask(im_cleanse(ops, z), ("bl.last.active", B.nch, kc) + gk, lambda: np.where(valid, 0.5 / kc, 0.0))
+    cheb = getattr(ops, "sm_cheb_gs", False)
+    rounds = smcheb.rounds(cfg, kc) if cheb else _recip_rounds(_KcExtrapolated(cfg), kc, ops.sm_gs_first)
+    first = np.arange(t) == 0
+    Y = Z
+    for i, r in enumerate(rounds):
+        if i:
+            Z = ops.square(im_cleanse(ops, Y))
+        D = ops.add(Z, ops.rotate(Z, B.K * tH)) if G == 1 else rotsum(ops, Z, B.K * tH, R * tH)   # every chunk's keys
+        D = rotsum(ops, D, 1, t)                                   # the key sum on each group's first lane
+        a, b, iters = r[0] * r[3], r[1] * r[3] * r[3], r[2]
+        cv = None if not cheb else ([[r[4][0][j]] * t for j in range(iters - 1)], [r[4][1]] * t)
+        # seeds on the first lane only: the reciprocal is zero elsewhere, and the ladder spreads it to every lane
+        rc = recip_lanes(sub_rt(rt, B, 0), D, np.where(first, a, 0.0), np.where(first, b, 0.0), iters,
+                         ("last", round(a, 12), round(b, 15)), cv)
+        Y = ops.mult(Z, rotsum(ops, rc, -1, t))
+    outs = []
+    for k in range(B.K):
+        if k not in ks:
+            outs.append(ops.sub(Q[0][k], Q[0][k]))
+            continue
+        acc = None
+        for g in range(G):
+            m = np.where(cls == 2 * g * B.K + k, 1.0, 0.0) + np.where(cls == (2 * g + 1) * B.K + k, -1j, 0.0)
+            pc = rotsum(ops, rt.mult_mask(Y, ("bl.last.pv", B.nch, k) + pair(g), lambda m=m: m), tH, R * tH)
+            pv = ops.mult(pc, V[g][kvb(k)])                                # (P_2g - i P_2g+1) (V_2g + i V_2g+1)
+            acc = pv if acc is None else ops.add(acc, pv)
+        o = im_cleanse(ops, rotsum(ops, acc, -1, t))                      # sum over the lanes, on the last lane
+        o = rt.mult_mask(o, ("bl.last.o", B.nch, t - 1), lambda: (np.arange(N) % t == t - 1).astype(float))
+        o = rotsum(ops, o, 1, t)
+        outs.append(ops.add(o, ops.mult_i(o)))
+    return [outs]
+
+
+def blocked_rot_steps(B: Blocks, radix_bits: int = 0) -> set[int]:
+    """Signed rotation steps (keys match exactly): lane moves, region spread (-r), radix ladder groups."""
+    gd = B.group_dims(0)
+    steps = {k for k in range(1, B.t)} | {-k for k in range(1, B.t)}
+    r = B.t
+    while r < 512:
+        steps.add(-r)
+        r *= 2
+    if radix_bits >= 2:
+        for a, b in ((B.t, gd.N), (gd.tH, gd.N), (B.t, 512)):
+            for grp in ladder_chunks(a, b, radix_bits):
+                if len(grp) > 1:
+                    steps.update(grp)
+    if prefill._BSGS and prefill._PACK:     # PF_ATTN_BSGS: giant lane shifts riding the score block shifts, both ways
+        Bb = 2 << prefill._PACK
+        for g in range(1, gd.d_head // Bb):
+            for par in (0, 1):
+                s = (2 * g + par) * gd.tH + Bb * (g % (B.t // Bb))     # lane step g mod t / Bb (d_head > t)
+                steps |= {s, -s, s - B.t, B.t - s}
+    return steps

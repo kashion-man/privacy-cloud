@@ -1,0 +1,350 @@
+"""configs.json -> the per-site approximation configs, with the JSON->struct name map of
+include/config_loader.h (eps -> epsilon, z0 -> taylor_z0, n_squarings -> log2delta1,
+refinement_iters -> log2delta2, thor_p1_a/b default -1/1) and the CutMax schedule
+(cutmax_config_from_calib, src/algorithms/nonlinear/cutmax.cu).
+"""
+from __future__ import annotations
+
+import dataclasses
+import json
+from typing import Optional
+
+
+@dataclasses.dataclass
+class NormCfg:
+    method: str                      # "remez" | "taylor"
+    epsilon: float
+    center_scale: float
+    taylor_z0: float
+    nr_iters: int = 16
+    inv_out_scale: float = 1.0
+    Ncoeffs: tuple = ()
+    Dcoeffs: tuple = ()
+    lin_alpha: float = 0.0
+    lin_beta: float = 0.0
+    gs_lo: float = 0.0
+    gs_hi: float = 0.0
+    gs_iters: int = 0
+    center_scale_sq: tuple = ()
+    precise_var_bts: bool = False
+    cheb_coeffs: tuple = ()          # Chebyshev seed of inv_out_scale/sqrt on [cheb_lo, cheb_hi]
+    cheb_lo: float = 0.0
+    cheb_hi: float = 0.0
+    cheb_nr_iters: int = 0
+    # spru: the token's mean and mean square of c x from ONE 1-slot refresh (norm._norm_spru) instead of the two
+    # rotation-sum ladders (decode only; needs the Chebyshev seed)
+    spru: int = 0
+    # zladder: the token's sum and sum of squares on one complex ladder (norm._norm_zladder) instead of two
+    zladder: int = 0
+
+    @property
+    def descale(self) -> float:
+        """ln_gamma_descale (include/weight_loader.h)."""
+        return 1.0 / self.inv_out_scale if self.method == "remez" else 1.0
+
+    def c_eff_sq(self, pos: int) -> float:
+        """norm.cu: the per-position centering scale squared."""
+        if self.center_scale_sq:
+            p = max(0, min(int(pos), len(self.center_scale_sq) - 1))
+            return float(self.center_scale_sq[p])
+        return float(self.center_scale) ** 2
+
+
+@dataclasses.dataclass
+class SoftmaxCfg:
+    log2delta1: int
+    log2delta2: int
+    clip_lo: float
+    clip_hi: float
+    poly_coeffs: tuple
+    init_alpha: float
+    init_beta: float
+    refine_alpha: tuple
+    refine_beta: tuple
+    gs_iters_scaled: int
+    gs_iters_refine_scaled: int
+    per_step_refine_iters: tuple
+    cheb_coeffs: tuple = ()
+    cheb_a: float = -1.0
+    cheb_b: float = 1.0
+    sm_kc_r: tuple = ()
+    gs_iters_first: int = 0          # the first division's count under SM_GS_FIRST
+    # SM_CHEB_GS (impl smcheb): Chebyshev-scaled Goldschmidt counts per round and the mid-round residual targets
+    recip_iters_cheb: tuple = ()
+    recip_targets: tuple = ()
+    # reference-key centring (attention.complex_qkt): per head the key whose score is subtracted before the exp
+    # (REF_SINK key 0, REF_SELF the query's own key, REF_PREV the one before it); empty = the mid-centred exp.
+    # ref_window: the most keys the centred config covers (the broadcast ladder's length)
+    ref_keys: tuple = ()
+    ref_window: int = 0
+    # key_lanes: while the cache holds at most this many keys (a power of two below t), the attention's lane ladders
+    # (q's replicate, the head sums and their replicates, P.V's key sum) run over that many lanes instead of t
+    # (attention._key_lanes); 0 = t
+    key_lanes: int = 0
+    # exp_mask_fold: the active mask (its 2^log2delta1-th root) rides the exp's Chebyshev giants and last leaf
+    # (poly.eval_chebyshev_masked) instead of a product after the squarings: the exp a level shallower; 2: a leaf with
+    # no slack takes it term by term (leaf_terms="budget"), so a series whose leaves have none keeps its depth too
+    exp_mask_fold: int = 0
+    # pair_heads: while the key window (key_lanes) is half a head's t lanes, the softmax runs on scores packed two heads
+    # to a t-lane block (head h + H/2 on lanes t/2.. of head h's block), tH/2-periodic, so its refreshes route on
+    # tH/2 slots (attention._pair); 0 = the tH-periodic layout
+    pair_heads: int = 0
+    # gs_num: every reciprocal round's scores folded into its Goldschmidt recursion (poly.goldschmidt_recip num=): the
+    # round's product goes, and inside a round the state is one ciphertext (a refresh may sit anywhere in it)
+    gs_num: int = 0
+    # gs_num_refresh (with gs_num): a deliberate refresh of each round's numerator right before its last squaring
+    # (round 0: the exp's last squaring; a refine round: its square of 2 Re y). The squaring turns the refresh's
+    # absolute floor e into 2 v e, proportional to each key's own value, and the round's whole recursion then fits the
+    # window after it (the planner keeps refreshes off the packed state: FORBID_STEPS .num). Refreshing the packed
+    # state instead gives every key's numerator an independent floor at the scale of the state's maximum (the head
+    # sum or the sink key), which the next round and P.V sum over the keys (512-key decode: KL 3.5e-3 on GPT-2,
+    # 3.9e-3 on Llama, against ~5e-6 without gs_num)
+    gs_num_refresh: int = 0
+    # gs_num_first (with gs_num): the first reciprocal round folded; earlier rounds keep their product. 1 = the refine
+    # rounds only: round 0's recursion is the longest (the first division, SM_GS_FIRST) and with gs_num_refresh it does
+    # not fit between its numerator's refresh (the dense StC-first landing at a 512-key cache, SM_PERIODIC=2) and the
+    # next round's (the StC-first entry): GPT-2 decode, round 0 spans 22-26 levels against the 22 of that window (blocks
+    # 3, 4: +2; 6, 9, 10: +4), every refine round 16-20. Its numerator cannot be refreshed inside its recursion, so
+    # round 0 runs as without gs_num (no per-key values in its recursion state: refreshable anywhere)
+    gs_num_first: int = 0
+
+    def kc_r(self, i: int, kc: int) -> float:
+        """cachemir_attention.cu: the per-step per-kc refine scaling."""
+        if self.sm_kc_r and self.log2delta2 > 0:
+            C = len(self.sm_kc_r) // self.log2delta2
+            kpos = max(0, min(int(kc) - 1, C - 1))
+            return float(self.sm_kc_r[i * C + kpos])
+        if kc > 0:
+            return min(1.0, 4.0 / kc)
+        return 1.0
+
+
+REF_SINK, REF_SELF, REF_PREV = 0, 1, 2
+_REF_NAMES = {"sink": REF_SINK, "self": REF_SELF, "prev": REF_PREV}
+
+
+def ref_key(kind: int, kc: int) -> int:
+    """The cache index of a reference key at cache count kc (the previous key of the first query is its own)."""
+    return 0 if kind == REF_SINK else kc - 1 if kind == REF_SELF else max(kc - 2, 0)
+
+
+@dataclasses.dataclass
+class GeluCfg:
+    method: str
+    xmax: float = 1.0
+    thor_p1: tuple = ()
+    thor_p2: tuple = ()
+    thor_p1_cheb: tuple = ()
+    thor_p2_cheb: tuple = ()
+    thor_p1_a: float = -1.0
+    thor_p1_b: float = 1.0
+    thor_p2_a: float = -1.0
+    thor_p2_b: float = 1.0
+    cheb_coeffs: tuple = ()
+    cheb_a: float = -1.0
+    cheb_b: float = 1.0
+    cheb_eps: float | None = None     # coefficient trim (relative to the largest), None = poly.CHEB_COEFF_EPS
+    # mask_fold (chebyshev under GELU_FOLD): the lane mask rides the series' giants and last leaf
+    # (poly.eval_chebyshev_masked) instead of a product after the sum: the GELU a level shallower; 2: term by term in
+    # the leaves with no slack (leaf_terms="budget")
+    mask_fold: int = 0
+    # single_cheb (thor_composite, the prefill's joint GLU path under PF_SILU_SINGLE): the odd series of
+    # sigma(xmax t) - 1/2 on t in [-1, 1] the site runs instead of the composite; empty = derived at runtime
+    # (prefill.silu_single_coeffs over PF_SILU_SINGLE_DEGS)
+    single_cheb: tuple = ()
+
+
+@dataclasses.dataclass
+class CutMaxIter:
+    p: int
+    c: float
+    m: float
+    s2_hi: float
+    passes: int
+    ex2: int
+    ca: float = 0.0
+    cb: float = 0.0
+    casc_iters: int = 0
+    # the scaled normaliser (head.cutmax_argmax_packed): 1/sigma from x_scale * sum (x - mu)^2 in (0, 1] by the
+    # Newton steps (a, b) of poly.inv_sqrt_newton_scaled; empty = the cascade above
+    x_scale: float = 0.0
+    newton: tuple = ()
+
+
+@dataclasses.dataclass
+class CutMaxCfg:
+    iters: tuple
+    newton_per_pass: int = 4
+    newton_polish: int = 0
+    sum_lo: float = 0.0
+    sum_hi: float = 0.0
+    gs_sum_iters: int = 4
+    entry_scale: float = 1.0 / 256.0
+    # the final 1/S as (1/sqrt(sum_scale S))^2 by poly.inv_sqrt_newton_scaled; empty = Goldschmidt on [sum_lo, sum_hi]
+    sum_scale: float = 0.0
+    sum_newton: tuple = ()
+    # scaled normalisers only: the 1-slot refreshes take the sum's vector itself (the refresh returns its slot mean,
+    # no all-slot ladder first) / the first Newton step's -b rides the refreshed input (that step costs no level)
+    spru_mean: int = 0
+    newton_fold: int = 0
+    # the entry's 1-slot refresh reads D conj(E), E = D times its constant from the logits' own masked products (no
+    # product of D's square): with the logits a level earlier (lnf_fold), D needs no refresh of its own
+    entry_dd: int = 0
+    # the packed CutMax's pow_odd lanes share one conjugate of the refreshed vector
+    conj_once: int = 0
+    # the scaled normalisers' centring sums at a usable plaintext scale (the masks M k / 2n multiply a sum over the
+    # vocabulary, so a mask that rounds to a few integers at its level's scale (2^36 / 2^44.15 on n32sp) shifts one tile
+    # against the other). out_scale[i]: iteration i's output y times this factor, folded into u's last Newton step and
+    # the shift (no product), so the next iteration's powers and its centring sum are out_scale^p times smaller and its
+    # mask as much larger (the next k reads it back; empty = 1). lm_centre: the LM head's columns centred on their
+    # mean (an exact shift of every logit by the same value), so the entry's centring sum is ~0, not 2 n mean.
+    # Out of repr: the slot cache keys its variant on repr(cfgs); lm_tiles keys lm_centre itself.
+    out_scale: tuple = dataclasses.field(default=(), repr=False)
+    # newton_carry[i]: iteration i's folded Newton steps after the second hold y / newton_carry (poly.
+    # inv_sqrt_newton_folded's carry): y = 1 / sqrt(t) is ~100 where t is small, and its w b / b1 operands ~1e-4
+    newton_carry: tuple = dataclasses.field(default=(), repr=False)
+    lm_centre: int = dataclasses.field(default=0, repr=False)
+
+
+@dataclasses.dataclass
+class ModelCfg:
+    n_layers: int
+    n_embd: int
+    n_head: int
+    n_inner: int
+
+
+@dataclasses.dataclass
+class Configs:
+    model: ModelCfg
+    norm: dict
+    softmax: dict
+    gelu: dict
+    cutmax: Optional[CutMaxCfg]
+    # ln_f folded into the LM head (its gain into the weights, its bias as the normalised input's shift): one product
+    # fewer at the end of the tail, so the logits leave it a level earlier (examples/gpt2 weights.lm_head_matrix)
+    lnf_fold: int = 0
+
+    def block(self, b: int):
+        base = f"transformer.h.{b}"
+        return (self.norm[base + ".ln_1"], self.norm[base + ".ln_2"],
+                self.softmax[base + ".attn"], self.gelu[base + ".mlp.act"])
+
+    @property
+    def ln_f(self):
+        return self.norm["transformer.ln_f"]
+
+
+def _tup(v):
+    return tuple(float(x) for x in v) if v is not None else ()
+
+
+def parse_norm(j: dict) -> NormCfg:
+    method = j.get("method", "taylor")
+    cfg = NormCfg(method=method, epsilon=float(j["eps"]), center_scale=float(j["center_scale"]),
+                  taylor_z0=float(j["z0"]), nr_iters=int(j.get("nr_iters", 16)))
+    if method == "remez":
+        cfg.inv_out_scale = float(j["inv_out_scale"])
+        cfg.Ncoeffs = _tup(j["Ncoeffs"])
+        cfg.Dcoeffs = _tup(j["Dcoeffs"])
+        cfg.lin_alpha = float(j["lin_alpha"])
+        cfg.lin_beta = float(j["lin_beta"])
+        cfg.gs_lo = float(j["gs_lo"])
+        cfg.gs_hi = float(j["gs_hi"])
+        cfg.gs_iters = int(j["gs_iters"])
+        cfg.center_scale_sq = _tup(j.get("center_scale_sq"))
+        cfg.precise_var_bts = bool(j.get("precise_var_bts", False))
+        if "cheb_coeffs" in j:
+            cfg.cheb_coeffs = _tup(j["cheb_coeffs"])
+            cfg.cheb_lo, cfg.cheb_hi = float(j["cheb_lo"]), float(j["cheb_hi"])
+            cfg.cheb_nr_iters = int(j["cheb_nr_iters"])
+        cfg.spru = int(j.get("spru", 0))
+        cfg.zladder = int(j.get("zladder", 0))
+    return cfg
+
+
+def parse_softmax(j: dict) -> SoftmaxCfg:
+    return SoftmaxCfg(
+        log2delta1=int(j["n_squarings"]), log2delta2=int(j["refinement_iters"]),
+        clip_lo=float(j["clip_lo"]), clip_hi=float(j["clip_hi"]),
+        poly_coeffs=_tup(j["poly_coeffs"]), init_alpha=float(j["init_alpha"]),
+        init_beta=float(j["init_beta"]), refine_alpha=_tup(j["refine_alpha"]),
+        refine_beta=_tup(j["refine_beta"]), gs_iters_scaled=int(j["gs_iters_scaled"]),
+        gs_iters_refine_scaled=int(j["gs_iters_refine_scaled"]),
+        per_step_refine_iters=_tup(j["per_step_refine_iters"]),
+        cheb_coeffs=_tup(j.get("cheb_coeffs")), cheb_a=float(j.get("cheb_a", -1.0)),
+        cheb_b=float(j.get("cheb_b", 1.0)), sm_kc_r=_tup(j.get("sm_kc_r")),
+        gs_iters_first=int(j.get("gs_iters_first", 0)),
+        recip_iters_cheb=_tup(j.get("recip_iters_cheb")), recip_targets=_tup(j.get("recip_targets")),
+        ref_keys=tuple(_REF_NAMES[r] for r in j.get("ref_keys", ())), ref_window=int(j.get("ref_window", 0)),
+        key_lanes=int(j.get("key_lanes", 0)), exp_mask_fold=int(j.get("exp_mask_fold", 0)),
+        pair_heads=int(j.get("pair_heads", 0)), gs_num=int(j.get("gs_num", 0)),
+        gs_num_refresh=int(j.get("gs_num_refresh", 0)), gs_num_first=int(j.get("gs_num_first", 0)))
+
+
+def parse_gelu(j: dict) -> GeluCfg:
+    method = j["method"]
+    if method == "thor_composite":
+        return GeluCfg(method=method, xmax=float(j["xmax"]), thor_p1=_tup(j["thor_p1"]),
+                       thor_p2=_tup(j["thor_p2"]), thor_p1_cheb=_tup(j.get("thor_p1_cheb")),
+                       thor_p2_cheb=_tup(j.get("thor_p2_cheb")),
+                       thor_p1_a=float(j.get("thor_p1_a", -1.0)), thor_p1_b=float(j.get("thor_p1_b", 1.0)),
+                       thor_p2_a=float(j.get("thor_p2_a", -1.0)), thor_p2_b=float(j.get("thor_p2_b", 1.0)),
+                       single_cheb=_tup(j.get("single_cheb_coeffs")))
+    if method == "chebyshev":
+        # xmax: with GELU_FOLD the up-projection carries 1/xmax and the output mask xmax (as for thor_composite)
+        return GeluCfg(method=method, xmax=float(j.get("xmax", 1.0)), cheb_coeffs=_tup(j["cheb_coeffs"]),
+                       cheb_a=float(j["cheb_a"]), cheb_b=float(j["cheb_b"]),
+                       cheb_eps=(float(j["cheb_eps"]) if j.get("cheb_eps") is not None else None),
+                       mask_fold=int(j.get("mask_fold", 0)))
+    raise ValueError(f"GELU method {method!r} is not ported (thor_composite / chebyshev only)")
+
+
+def _steps(v):
+    return tuple((float(a), float(b)) for a, b in v)
+
+
+def parse_cutmax(j: dict) -> CutMaxCfg:
+    T = len(j["p"])
+    if "newton" in j:                     # the scaled normalisers (calibrate.approximations.cutmax.fit_scaled)
+        for k in ("c", "m", "x_scale", "newton"):
+            if len(j[k]) != T:
+                raise ValueError("cutmax calib: ragged/empty schedule arrays")
+        for k in ("out_scale", "newton_carry"):
+            if len(j.get(k, ())) not in (0, T):
+                raise ValueError(f"cutmax calib: {k} needs one factor per iteration")
+        iters = tuple(CutMaxIter(int(j["p"][i]), float(j["c"][i]), float(j["m"][i]), 0.0, 0, 0,
+                                 x_scale=float(j["x_scale"][i]), newton=_steps(j["newton"][i])) for i in range(T))
+        return CutMaxCfg(iters=iters, entry_scale=float(j["entry_scale"]), sum_scale=float(j["sum_scale"]),
+                         sum_newton=_steps(j["sum_newton"]), spru_mean=int(j.get("spru_mean", 0)),
+                         newton_fold=int(j.get("newton_fold", 0)), conj_once=int(j.get("conj_once", 0)),
+                         entry_dd=int(j.get("entry_dd", 0)),
+                         out_scale=tuple(float(s) for s in j.get("out_scale", ())),
+                         newton_carry=tuple(float(s) for s in j.get("newton_carry", ())),
+                         lm_centre=int(j.get("lm_centre", 0)))
+    for k in ("c", "m", "s2_hi", "passes", "ex2", "chord_a", "chord_b", "cascade_iters"):
+        if len(j[k]) != T:
+            raise ValueError("cutmax calib: ragged/empty schedule arrays")
+    iters = tuple(CutMaxIter(int(j["p"][i]), float(j["c"][i]), float(j["m"][i]),
+                             float(j["s2_hi"][i]), int(j["passes"][i]), int(j["ex2"][i]),
+                             float(j["chord_a"][i]), float(j["chord_b"][i]),
+                             int(j["cascade_iters"][i])) for i in range(T))
+    return CutMaxCfg(iters=iters, newton_per_pass=int(j["newton_per_pass"]),
+                     newton_polish=int(j["newton_polish"]), sum_lo=float(j["sum_lo"]),
+                     sum_hi=float(j["sum_hi"]), gs_sum_iters=int(j["gs_sum_iters"]),
+                     entry_scale=float(j["entry_scale"]))
+
+
+def load_configs(path: str) -> Configs:
+    from perseus._paths import resolve
+    with open(resolve(path)) as f:
+        j = json.load(f)
+    m = j.get("model", {})
+    model = ModelCfg(int(m.get("n_layers", 0)), int(m.get("n_embd", 0)),
+                     int(m.get("n_head", 0)), int(m.get("n_inner", 0)))
+    return Configs(model=model,
+                   norm={k: parse_norm(v) for k, v in j.get("norm", {}).items()},
+                   softmax={k: parse_softmax(v) for k, v in j.get("softmax", {}).items()},
+                   gelu={k: parse_gelu(v) for k, v in j.get("softgelu", {}).items()},
+                   cutmax=parse_cutmax(j["cutmax"]) if "cutmax" in j else None,
+                   lnf_fold=int(j.get("lnf_fold", 0)))

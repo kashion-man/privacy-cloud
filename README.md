@@ -26,7 +26,7 @@ bash run.sh agent --config config.local.json --route local
 
 ### GPU 加速的本地生成
 
-在本地安装 [dzyy-vllm](https://github.com/dzyy-team/dzyy-vllm) 及与当前 PyTorch/CUDA 匹配的 FlashAttention、FlashInfer 和 Triton。已核验的上游提交为 `87d7e49fd2758b37690fa0292cb313002baddf7e`。在 `config.local.json` 增加配置项。
+在本地安装 [dzyy-vllm](https://github.com/dzyy-team/dzyy-vllm) 及与当前 PyTorch/CUDA 匹配的 FlashAttention、FlashInfer 和 Triton。在 `config.local.json` 增加配置项。
 
 ```json
 {

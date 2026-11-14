@@ -1,15 +1,46 @@
-"""V0 autoregression: full-prefix forward on each step, eager, no KV cache."""
+"""Local Qwen3 with distinct answer and differentiable privacy paths."""
 import math
 from .errors import PrivacyError
 
 
 class LocalModel:
     def __init__(self, config):
-        from .v0.config import EngineConfig
-        from .v0.engine import Engine
-        self.engine = Engine(EngineConfig(model=config.model_path, context_len=config.context_len))
-        self.engine.model.requires_grad_(False)
+        self.config = config
+        self._engine = None
+        self._fast = None
         self.ner_max_new_tokens = config.ner_max_new_tokens
+
+    def release_answer_backend(self):
+        if self._fast is not None:
+            self._fast.close()
+            self._fast = None
+
+    @property
+    def engine(self):
+        if self._engine is None:
+            self.release_answer_backend()
+            from .eager.config import EngineConfig
+            from .eager.engine import Engine
+
+            self._engine = Engine(EngineConfig(model=self.config.model_path, context_len=self.config.context_len))
+            self._engine.model.requires_grad_(False)
+        return self._engine
+
+    def answer(self, system, text, max_new_tokens=256):
+        return self.answer_many([(system, text)], max_new_tokens)[0]
+
+    def answer_many(self, messages, max_new_tokens=256):
+        if self.config.answer_backend == "eager":
+            return [self.chat(system, text, max_new_tokens) for system, text in messages]
+        try:
+            if self._fast is None:
+                from .fast_answer import FastAnswer
+                self._engine = None
+                self._fast = FastAnswer(self.config)
+            prompts = [self._fast.encode(system, text) for system, text in messages]
+            return self._fast.generate(prompts, max_new_tokens)
+        except (ImportError, OSError, RuntimeError, ValueError) as exc:
+            raise PrivacyError("Accelerated local answer failed; check CUDA dependencies, input length and memory") from exc
 
     def chat(self, system, text, max_new_tokens=256):
         tokenizer = self.engine.tokenizer
@@ -17,7 +48,7 @@ class LocalModel:
             [{"role": "system", "content": system}, {"role": "user", "content": text}],
             tokenize=False, add_generation_prompt=True, enable_thinking=False)
         # Transformers 4 returns token lists while 5 may return BatchEncoding.
-        # Render first and encode explicitly for a stable V0 input contract.
+        # Render first and encode explicitly for a stable input contract.
         prompt = tokenizer.encode(prompt, add_special_tokens=False)
         try:
             return "".join(piece for piece, _ in self.engine.generate(

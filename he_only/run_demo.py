@@ -16,8 +16,8 @@ import time
 
 import numpy as np
 
-from qwen_fhe_v0.client import Client
-from qwen_fhe_v0.weights import Weights
+from qwen_fhe.client import Client
+from qwen_fhe.weights import Weights
 
 
 def main():
@@ -66,10 +66,10 @@ def main():
     print(json.dumps({'stage': 'client_keygen', 'context_tokens': len(ids)}), flush=True)
     client_type = Client
     if args.backend == 'perseus':
-        from qwen_fhe_v0.perseus_client import PerseusClient
+        from qwen_fhe.perseus_client import PerseusClient
         client_type = PerseusClient
     elif args.backend == 'perseus-multigpu':
-        from qwen_fhe_v0.perseus_multi_client import PerseusMultiClient
+        from qwen_fhe.perseus_multi_client import PerseusMultiClient
         client_type = PerseusMultiClient
     client = client_type(width=int(weights.config['hidden_size']))
     client.save_public_bundle(work/'public')
@@ -80,7 +80,7 @@ def main():
     for index, embedding in enumerate(weights.embedding(ids)):
         client.write_ciphertext(client.encrypt(embedding), request/('%d.bin' % index))
     (request/'request.json').write_text(json.dumps({'tokens': len(ids)}))
-    command = [sys.executable, '-u', '-m', 'qwen_fhe_v0.server',
+    command = [sys.executable, '-u', '-m', 'qwen_fhe.server',
                '--model', str(Path(args.model).resolve()), '--bundle', str(work/'public'),
                '--approximation', str(Path(args.approximation).resolve()),
                '--input', str(request), '--output', str(response),

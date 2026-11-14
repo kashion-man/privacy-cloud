@@ -1,8 +1,4 @@
-"""Dense Qwen3 full-prefix forward, using BFV linear ops and genuine 2PC.
-
-No attention state survives a call. Public attention scaling is fused into
-the segmented HE reduction to stay within the linear-only BFV noise budget.
-"""
+"""Full-history dense Qwen3 forward over ciphertexts. No attention state survives a call."""
 from __future__ import annotations
 
 import math
@@ -25,14 +21,14 @@ class QwenForward:
         self.kv_heads = int(c['num_key_value_heads'])
         self.head_dim = int(c.get('head_dim', self.hidden//self.heads))
         if ops.width != self.hidden or self.hidden != self.heads*self.head_dim:
-            raise ValueError('v0 uses one SIMD vector per hidden token')
+            raise ValueError('The encrypted evaluator uses one SIMD vector per hidden token')
         if self.heads % self.kv_heads:
             raise ValueError('Invalid GQA geometry')
         self.rope_config = c.get('rope_parameters') or c.get('rope_scaling') or {}
         if self.rope_config.get('rope_type', self.rope_config.get('type', 'default')) != 'default':
-            raise ValueError('v0 supports default RoPE only')
+            raise ValueError('The encrypted evaluator supports default RoPE only')
         if c.get('attention_bias', False):
-            raise ValueError('v0 expects the bias-free Qwen3 checkpoint')
+            raise ValueError('The encrypted evaluator expects the bias-free Qwen3 checkpoint')
 
     def _weight(self, layer, name):
         return self.weights.tensor('model.layers.%d.%s' % (layer, name))
@@ -64,8 +60,7 @@ class QwenForward:
             k = [ops.rope(self._norm(x, k_gamma, '%d.k' % layer), p, self.head_dim, theta) for p, x in enumerate(k)]
             attention = []
             for position, query in enumerate(q):
-                scores = [ops.group_sum(ops.mul(query, key), self.head_dim,
-                                        scale=1.0/math.sqrt(self.head_dim)) for key in k[:position+1]]
+                scores = [ops.mul_plain(ops.group_sum(ops.mul(query, key), self.head_dim), 1.0/math.sqrt(self.head_dim)) for key in k[:position+1]]
                 probabilities = ops.softmax(scores, **self.approximations.get('softmax', {}))
                 attention.append(ops.sum_values(ops.mul(prob, value) for prob, value in zip(probabilities, v[:position+1])))
             out_weight = self._weight(layer, 'self_attn.o_proj.weight')

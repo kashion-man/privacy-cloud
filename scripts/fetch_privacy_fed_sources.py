@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import urllib.request
 
-from build_privacy_fed_v0 import digest, normal, read_jsonl, write_jsonl
+from build_seed_dataset import digest, normal, read_jsonl, write_jsonl
 
 
 OPEN_REPO = "ai4privacy/pii-masking-openpii-1.5m"

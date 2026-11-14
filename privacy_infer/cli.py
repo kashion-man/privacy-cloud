@@ -13,7 +13,7 @@ from .errors import PrivacyError
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Local Qwen3 / privacy-gated DeepSeek inference")
-    parser.add_argument("command", choices=["local", "sanitize", "infer"])
+    parser.add_argument("command", choices=["local", "local-batch", "sanitize", "infer"])
     parser.add_argument("--config", default="config.json")
     parser.add_argument("--input", type=Path, help="UTF-8 JSON with task and context; otherwise hidden interactive input")
     parser.add_argument("--send", action="store_true", help="Send sanitized fields to DeepSeek (infer only)")
@@ -45,7 +45,7 @@ def main(argv=None):
         if args.stamp_epsilons is not None:
             overrides["stamp_group_epsilons"] = tuple(args.stamp_epsilons)
         config = replace(config, **overrides)
-        if args.command == "local" and (args.privacy_mode is not None or args.stamp_base_epsilon is not None or args.stamp_epsilons is not None or args.sensitive_importance is not None or args.prosan_threshold is not None):
+        if args.command in {"local", "local-batch"} and overrides:
             raise PrivacyError("Privacy mode options require sanitize or infer")
         if args.prosan_threshold is not None and config.sensitive_importance != "prosan":
             raise PrivacyError("ProSan threshold requires ProSan sensitive importance")
@@ -55,6 +55,24 @@ def main(argv=None):
             raise PrivacyError("--send requires infer")
         if args.send and not get_api_key():
             raise PrivacyError("Set DEEPSEEK_API_KEY before sending")
+        if args.command == "local-batch":
+            from .local import LocalModel
+
+            if args.input is None or args.input.stat().st_size > config.max_input_chars * 12 * config.max_batch_size + 1024:
+                raise PrivacyError("local-batch requires a bounded JSON input file")
+            rows = json.loads(args.input.read_text(encoding="utf-8"))
+            if type(rows) is not list or not 1 <= len(rows) <= config.max_batch_size:
+                raise PrivacyError("Invalid local batch size")
+            messages = []
+            for row in rows:
+                if type(row) is not dict or set(row) != {"task", "context"}:
+                    raise PrivacyError("Batch entries must contain task and context")
+                task, context = row["task"], row["context"]
+                if type(task) is not str or type(context) is not str or len(task) + len(context) > config.max_input_chars:
+                    raise PrivacyError("Invalid input or size limit exceeded")
+                messages.append(("You are a helpful assistant.", task + "\n\n" + context))
+            print(json.dumps(LocalModel(config).answer_many(messages, args.max_new_tokens),ensure_ascii=False))
+            return 0
         if args.input:
             if args.input.stat().st_size > config.max_input_chars * 12 + 1024:
                 raise PrivacyError("Input file too large")
@@ -70,7 +88,7 @@ def main(argv=None):
         from .local import LocalModel
         model = LocalModel(config)
         if args.command == "local":
-            print(model.chat("You are a helpful assistant.", task + "\n\n" + context, args.max_new_tokens))
+            print(model.answer("You are a helpful assistant.", task + "\n\n" + context, args.max_new_tokens))
             return 0
         from .cloud import DeepSeekClient
         from .detection import LocalDetector

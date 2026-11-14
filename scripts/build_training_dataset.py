@@ -1,4 +1,4 @@
-"""Build a separate v1 dataset, preserving v0 and the agreed quotas."""
+"""Build the audited Non-IID dataset from the seed corpus."""
 
 import argparse
 from collections import defaultdict
@@ -11,8 +11,8 @@ import random
 import re
 import tempfile
 
-import build_privacy_fed_v0 as base
-from audit_privacy_fed_v0 import audit, cue_diagnostics
+import build_seed_dataset as base
+from audit_dataset import audit, cue_diagnostics
 
 
 SEED = 20261113
@@ -356,8 +356,8 @@ def eval_set(split, scenes, rng, length, maximum):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--old", type=Path, default=Path("data/privacy_fed_v0"))
-    parser.add_argument("--raw", type=Path, default=Path("data/staging/privacy_fed_v0"))
+    parser.add_argument("--old", type=Path, default=Path("data/seed"))
+    parser.add_argument("--raw", type=Path, default=Path("data/raw"))
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--tokenizer", required=True)
     args = parser.parse_args()
@@ -374,7 +374,7 @@ def main():
     old = base.read_jsonl(args.old/"train.jsonl")
     external,changes = repair_sources(old,args.raw,length,rng,maximum,held_out)
     train = repair_training(old,length,maximum)+external
-    scene_path = Path(__file__).with_name("privacy_fed_v1_eval.txt")
+    scene_path = Path(__file__).with_name("evaluation_scenarios.txt")
     scenes = load_scenes(scene_path)
     splits = {"train":train}
     for split in ("validation","test"):
@@ -423,7 +423,7 @@ def main():
     if checked["findings"]:
         raise ValueError(f"Original targeted issues remain: {checked['findings']}")
     print(json.dumps(dict(changes=changes, rewritten=report["train_joint_rows_rewritten"],
-                          v1_test=cue_diagnostics(splits["test"])),ensure_ascii=False,indent=2))
+                          held_out_diagnostics=cue_diagnostics(splits["test"])),ensure_ascii=False,indent=2))
 
 
 if __name__ == "__main__":

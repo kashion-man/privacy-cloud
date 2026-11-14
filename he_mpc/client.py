@@ -84,7 +84,7 @@ def main():
                 tokenize=False, add_generation_prompt=True, enable_thinking=False)
     ids = tokenizer.encode(prompt, add_special_tokens=False)
     if not ids or len(ids)+args.steps-1 > 32:
-        raise ValueError('Prompt exceeds public v0 context limit')
+        raise ValueError('Prompt exceeds public context limit')
     weights = Weights(args.model)
     vectors = weights.embedding(ids)
     probe = weights.embedding([0,1,2,3]).astype('<f4')

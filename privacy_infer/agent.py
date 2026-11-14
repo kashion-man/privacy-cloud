@@ -88,7 +88,8 @@ class PrivacyAgent:
 
         def local(_state):
             try:
-                answer = self.model.chat(ANSWER, payload, max_new_tokens)
+                answer_fn = getattr(self.model, "answer", self.model.chat)
+                answer = answer_fn(ANSWER, payload, max_new_tokens)
                 if not isinstance(answer, str) or not answer.strip():
                     raise PrivacyError("Empty local answer")
                 return {"outcome": "local", "answer": answer}

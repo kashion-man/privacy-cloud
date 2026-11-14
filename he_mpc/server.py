@@ -84,7 +84,7 @@ def main():
     from qwen import QwenForward
     steps = int(request['steps'])
     if not 1 <= steps <= 4 or not prefix or len(prefix)+steps-1 > 32:
-        raise ValueError('v0 supports up to four generated tokens and context 32')
+        raise ValueError('The encrypted evaluator supports up to four generated tokens and context 32')
     profile = dict(norm={k: {} for k in ['final']+[
         '%d.%s' % (layer, site) for layer in range(c['num_hidden_layers'])
         for site in ['input','q','k','post']

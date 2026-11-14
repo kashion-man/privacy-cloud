@@ -54,7 +54,7 @@ class PerseusMultiOps(PerseusOps):
         env = os.environ.copy()
         env['CUDA_VISIBLE_DEVICES'] = bootstrap_gpu
         self._service = subprocess.Popen([sys.executable, '-u', '-m',
-            'qwen_fhe_v0.bootstrap_service', '--bundle', str(bundle/'bootstrap'),
+            'qwen_fhe.bootstrap_service', '--bundle', str(bundle/'bootstrap'),
             '--socket', str(self._socket_path)], env=env, stdin=subprocess.DEVNULL,
             stdout=self._log, stderr=subprocess.STDOUT)
         atexit.register(self.close)

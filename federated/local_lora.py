@@ -268,9 +268,9 @@ def main():
         set_peft_model_state_dict(runtime.model,initial)
     if args.diagnosis_only:
         return
-    report["v2_before"]=evaluate(runtime,val)
+    report["before_training"]=evaluate(runtime,val)
     atomic_json(args.out/"report.json",report)
-    print("V2_BEFORE",report["v2_before"]["counts"],flush=True)
+    print("BEFORE_TRAINING",report["before_training"]["counts"],flush=True)
     rows=[json.loads(x) for x in (args.dataset/"train.jsonl").read_text("utf-8").splitlines()]
     data=train_rows(rows,runtime.tokenizer,runtime.eos,31)
     ids=list(data)
@@ -284,10 +284,10 @@ def main():
     save_file(get_adapter(runtime.model),args.out/"adapter_model.safetensors")
     runtime.model.peft_config["default"].save_pretrained(args.out)
     atomic_json(args.out/"report.json",report)
-    report["v2_after"]=evaluate(runtime,val)
+    report["after_training"]=evaluate(runtime,val)
     report["peak_reserved_mib"]=torch.cuda.max_memory_reserved()/2**20
     atomic_json(args.out/"report.json",report)
-    print("V2_AFTER",report["v2_after"]["counts"],flush=True)
+    print("AFTER_TRAINING",report["after_training"]["counts"],flush=True)
 
 
 if __name__=="__main__":

@@ -25,8 +25,28 @@ class Config:
     prosan_reference_tokens: int = 64
     prosan_max_tokens: int = 1024
     prosan_checkpointing: bool = True
+    answer_backend: str = "eager"
+    dzyy_engine_path: str | None = None
+    prefill_chunk_tokens: int = 512
+    max_batch_size: int = 2
+    prefix_cache: str = "none"
+    cuda_graph: bool = True
+    compile_prefill: bool = False
+    async_decode: bool = True
 
     def __post_init__(self):
+        if self.answer_backend not in {"eager", "accelerated"}:
+            raise ValueError("Unknown local answer backend")
+        if self.answer_backend == "accelerated" and not self.dzyy_engine_path:
+            raise ValueError("Accelerated answers require the local dzyy-vllm engine path")
+        if self.prefix_cache not in {"none", "hash", "radix"}:
+            raise ValueError("Invalid accelerated engine prefix backend")
+        if type(self.prefill_chunk_tokens) is not int or not 2 <= self.prefill_chunk_tokens <= 8192:
+            raise ValueError("Invalid accelerated engine prefill token budget")
+        if type(self.max_batch_size) is not int or not 1 <= self.max_batch_size <= 8:
+            raise ValueError("Invalid accelerated engine batch size")
+        if any(type(flag) is not bool for flag in (self.cuda_graph, self.compile_prefill, self.async_decode)):
+            raise ValueError("Acceleration switches must be boolean")
         for value in (self.context_len, self.ner_max_new_tokens,
                       self.cloud_max_tokens, self.max_input_chars, self.stamp_max_tokens,
                       self.stamp_decode_batch_size, self.stamp_vocab_chunk_size,

@@ -9,18 +9,18 @@ export PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"
 case "$command_name" in
   agent)    exec "$python_bin" -m privacy_infer.agent_cli "$@" ;;
   infer)    exec "$python_bin" -m privacy_infer "$@" ;;
-  he-only)  export QWEN_HE_PYTHON="${QWEN_HE_PYTHON:-$python_bin}"; exec bash "$root/he_only_v0/run.sh" "$@" ;;
-  he-gpu)   exec bash "$root/he_only_v0/run_perseus.sh" "$@" ;;
-  he-multi) exec bash "$root/he_only_v0/run_perseus_multi.sh" "$@" ;;
-  calibrate) exec "$python_bin" "$root/he_only_v0/calibrate.py" "$@" ;;
-  he-mpc)   exec "${HE_MPC_PYTHON:-$python_bin}" "$root/he_mpc_v0/client.py" "$@" ;;
-  he-mpc-server) exec "${HE_MPC_PYTHON:-$python_bin}" "$root/he_mpc_v0/server.py" "$@" ;;
+  he-only)  export QWEN_HE_PYTHON="${QWEN_HE_PYTHON:-$python_bin}"; exec bash "$root/he_only/run.sh" "$@" ;;
+  he-gpu)   exec bash "$root/he_only/run_perseus.sh" "$@" ;;
+  he-multi) exec bash "$root/he_only/run_perseus_multi.sh" "$@" ;;
+  calibrate) exec "$python_bin" "$root/he_only/calibrate.py" "$@" ;;
+  he-mpc)   exec "${HE_MPC_PYTHON:-$python_bin}" "$root/he_mpc/client.py" "$@" ;;
+  he-mpc-server) exec "${HE_MPC_PYTHON:-$python_bin}" "$root/he_mpc/server.py" "$@" ;;
   fetch-data) exec "$python_bin" "$root/scripts/fetch_privacy_fed_sources.py" "$@" ;;
-  build-data) exec "$python_bin" "$root/scripts/build_privacy_fed_v0.py" "$@" ;;
-  revise-data) exec "$python_bin" "$root/scripts/repair_privacy_fed_v1.py" "$@" ;;
-  pack-train) exec "$python_bin" "$root/fed_lora_v1/pack.py" "$@" ;;
-  fed-train) exec "$python_bin" "$root/fed_lora_v1/run.py" "$@" ;;
-  pilot)    exec "$python_bin" "$root/fed_lora_v1/pilot_v2.py" "$@" ;;
+  build-data) exec "$python_bin" "$root/scripts/build_seed_dataset.py" "$@" ;;
+  revise-data) exec "$python_bin" "$root/scripts/build_training_dataset.py" "$@" ;;
+  pack-train) exec "$python_bin" "$root/federated/pack.py" "$@" ;;
+  fed-train) exec "$python_bin" "$root/federated/run.py" "$@" ;;
+  pilot)    exec "$python_bin" "$root/federated/local_lora.py" "$@" ;;
   help|-h|--help)
     printf '%s\n' 'Usage: bash run.sh <command> [options]' \
       '  agent | infer' \

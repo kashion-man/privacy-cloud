@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import re
 
-from build_privacy_fed_v0 import DOMAINS, PAIR_COUNTS, normal, read_jsonl
+from build_seed_dataset import DOMAINS, PAIR_COUNTS, normal, read_jsonl
 
 
 def sha(path):
@@ -112,13 +112,13 @@ def audit(data, raw):
 
     expect(not check_hashes(data, quality["sha256"]), "shipped JSONL hashes")
     expect(not check_hashes(raw, manifest["files_sha256"]), "raw provenance hashes")
-    is_v1 = quality["version"] == "v1-candidate"
-    builder = "repair_privacy_fed_v1.py" if is_v1 else "build_privacy_fed_v0.py"
-    scenarios = "privacy_fed_v1_eval.txt" if is_v1 else "privacy_fed_scenarios.json"
+    is_federated = quality["version"] == "v1-candidate"
+    builder = "build_training_dataset.py" if is_federated else "build_seed_dataset.py"
+    scenarios = "evaluation_scenarios.txt" if is_federated else "privacy_fed_scenarios.json"
     expect(sha(Path(__file__).with_name(builder)) == quality["builder_sha256"], "builder hash")
     expect(sha(Path(__file__).with_name(scenarios)) == quality["scenario_sha256"], "scenario hash")
-    if is_v1:
-        expect(sha(Path(__file__).with_name("build_privacy_fed_v0.py")) ==
+    if is_federated:
+        expect(sha(Path(__file__).with_name("build_seed_dataset.py")) ==
                quality["base_builder_sha256"], "base builder hash")
     splits = {s: read_jsonl(data/(s+".jsonl")) for s in ("train", "validation", "test")}
     upstream_open = {r["uid"]: r for r in read_jsonl(raw/"open_zh_candidates.jsonl")}
@@ -189,7 +189,7 @@ def audit(data, raw):
                    f"{group}: pair structure")
             kinds = {r["metadata"]["pair_type"] for r in members}
             expect(len(kinds)==1, f"{group}: pair type")
-            if is_v1 and split != "train":
+            if is_federated and split != "train":
                 expected = {r["metadata"]["expected"] for r in members}
                 expect(len(expected) == 2 and all(
                     r["metadata"]["expected"] ==
@@ -205,7 +205,7 @@ def audit(data, raw):
             "normalized_prompt_count":len({normal(r["prompt"]) for r in rows}),
             "cue_diagnostics":cue_diagnostics(rows),
         }
-        if is_v1 and split != "train":
+        if is_federated and split != "train":
             diagnostic = split_stats[split]["cue_diagnostics"]
             expect(diagnostic["pair_groups_same_request_text"] == 400,
                    f"{split}: request preserved across each evaluation pair")
@@ -223,12 +223,12 @@ def audit(data, raw):
 
     train = {r["id"]:r for r in splits["train"]}
     client_stats = {}
-    modes = ("non_iid",) if is_v1 else ("iid", "non_iid")
-    if is_v1:
+    modes = ("non_iid",) if is_federated else ("iid", "non_iid")
+    if is_federated:
         expect(quality["client_partition"] == "non_iid" and quality["client_count"] == 10,
-               "v1 Non-IID partition metadata")
+               "Non-IID partition metadata")
         expect({p.name for p in (data/"clients").iterdir()} == set(modes),
-               "v1 ships only the Non-IID partition")
+               "federated dataset contains only the Non-IID partition")
     for mode in modes:
         paths = sorted((data/"clients"/mode).glob("C*.jsonl"))
         expect(len(paths) == 10, f"{mode}: client count")
@@ -309,8 +309,8 @@ def tokenizer_audit(data, tokenizer_path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data", type=Path, default=Path("data/privacy_fed_v0"))
-    parser.add_argument("--raw", type=Path, default=Path("data/staging/privacy_fed_v0"))
+    parser.add_argument("--data", type=Path, default=Path("data/seed"))
+    parser.add_argument("--raw", type=Path, default=Path("data/raw"))
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--tokenizer", help="Local Qwen3 tokenizer directory for full retokenization")
     args = parser.parse_args()

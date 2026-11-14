@@ -21,4 +21,4 @@ privacy-agent = "privacy_infer.agent_cli:main"
 include = ["privacy_infer*"]
 
 [tool.setuptools.package-data]
-"privacy_infer.v0" = ["LICENSE"]
+"privacy_infer.eager" = ["LICENSE"]

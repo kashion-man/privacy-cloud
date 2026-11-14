@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from qwen_fhe_v0.ops import fit_chebyshev
+from qwen_fhe.ops import fit_chebyshev
 
 
 PUBLIC_TEXTS = [
@@ -44,7 +44,7 @@ def fit_inverse(lo, hi):
         if error < 1e-5:
             fit['max_relative_fit_error'] = error
             return fit
-    raise ValueError('Public calibration band is too wide for the v0 inverse sqrt: %g..%g' % (lo, hi))
+    raise ValueError('Public calibration band is too wide for the inverse square-root circuit: %g..%g' % (lo, hi))
 
 
 def fit_model(model, token_sequences, degree=127):

@@ -26,7 +26,6 @@ class Config:
     prosan_max_tokens: int = 1024
     prosan_checkpointing: bool = True
     answer_backend: str = "eager"
-    dzyy_engine_path: str | None = None
     prefill_chunk_tokens: int = 512
     max_batch_size: int = 2
     prefix_cache: str = "none"
@@ -37,8 +36,6 @@ class Config:
     def __post_init__(self):
         if self.answer_backend not in {"eager", "accelerated"}:
             raise ValueError("Unknown local answer backend")
-        if self.answer_backend == "accelerated" and not self.dzyy_engine_path:
-            raise ValueError("Accelerated answers require the local dzyy-vllm engine path")
         if self.prefix_cache not in {"none", "hash", "radix"}:
             raise ValueError("Invalid accelerated engine prefix backend")
         if type(self.prefill_chunk_tokens) is not int or not 2 <= self.prefill_chunk_tokens <= 8192:
@@ -89,4 +86,7 @@ class Config:
 
     @classmethod
     def load(cls, path):
-        return cls(**json.loads(Path(path).read_text(encoding="utf-8")))
+        options = json.loads(Path(path).read_text(encoding="utf-8"))
+        # Existing configurations may still contain the former external checkout path.
+        options.pop("dzyy_engine_path", None)
+        return cls(**options)

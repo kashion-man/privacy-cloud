@@ -1,6 +1,5 @@
-"""Qwen3 answers through the locally installed dzyy-vllm engine."""
+"""Qwen3 answers through the bundled GPU inference engine."""
 from contextlib import redirect_stdout
-import importlib.util
 import json
 import math
 from pathlib import Path
@@ -13,28 +12,6 @@ from .errors import PrivacyError
 # Upstream uses a module-level FlashAttention context and process-wide CUDA
 # settings. Only one accelerated call may touch them at a time.
 _ENGINE_LOCK = RLock()
-
-
-def load_dzyy_engine(path):
-    root = Path(path).expanduser().resolve(strict=True) / "src"
-    if not (root / "__init__.py").is_file():
-        raise PrivacyError("The configured dzyy-vllm engine directory must contain src/__init__.py")
-    name = "_privacy_dzyy_engine"
-    if name in sys.modules:
-        module = sys.modules[name]
-        if Path(module.__file__).parent != root:
-            raise PrivacyError("Only one dzyy-vllm engine source path can be loaded per process")
-        return module
-    spec = importlib.util.spec_from_file_location(
-        name, root / "__init__.py", submodule_search_locations=[str(root)])
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    try:
-        spec.loader.exec_module(module)
-    except BaseException:
-        sys.modules.pop(name, None)
-        raise
-    return module
 
 
 class FastAnswer:
@@ -53,8 +30,10 @@ class FastAnswer:
         self.torch = torch
         self.engine = None
         with _ENGINE_LOCK, redirect_stdout(sys.stderr):
-            self.dzyy = load_dzyy_engine(config.dzyy_engine_path)
-            settings = self.dzyy.EngineConfig(
+            from .accelerated.config import EngineConfig
+            from .accelerated.control.engine import Engine
+
+            settings = EngineConfig(
                 model=str(model), context_len=config.context_len,
                 max_num_seqs=self.max_batch, max_num_batched_tokens=config.prefill_chunk_tokens,
                 num_kvcache_blocks=math.ceil(config.context_len / 256) * self.max_batch,
@@ -65,7 +44,7 @@ class FastAnswer:
                 raise PrivacyError("The accelerated engine requires dense Qwen3 and a valid context length")
             reduction = torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
             try:
-                self.engine = self.dzyy.Engine(settings)
+                self.engine = Engine(settings)
             finally:
                 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = reduction
         self.tokenizer = self.engine.tokenizer
@@ -79,6 +58,8 @@ class FastAnswer:
 
     def generate(self, prompts, max_new_tokens):
         """Generate one explicitly grouped batch, with cache state scoped to this call."""
+        from .accelerated.sampling_params import SamplingParams
+
         if not prompts or len(prompts) > self.max_batch or type(max_new_tokens) is not int or max_new_tokens < 0:
             raise ValueError("Invalid accelerated engine request count or generation budget")
         engine = self.engine
@@ -90,7 +71,7 @@ class FastAnswer:
             reduction = self.torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
             self.torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
             try:
-                params = self.dzyy.SamplingParams(max_tokens=max_new_tokens, temperature=0)
+                params = SamplingParams(max_tokens=max_new_tokens, temperature=0)
                 sequences = [engine.add_request(ids, params) for ids in prompts]
                 while not engine.scheduler.is_finished():
                     engine.step()

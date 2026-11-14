@@ -5,6 +5,7 @@ Qwen3-1.7B 端侧隐私 Agent、文本云推理、HE-only、HE-MPC 和 FedLoRA �
 | 目录 | 用途 |
 | --- | --- |
 | `privacy_infer/` | 本地 Qwen3、LangGraph 路由、工具权限、DeepSeek 出站审核、隐私模型旁路 |
+| `privacy_infer/accelerated/` | 内置 GPU 推理运行时，包括分页 KV、组批调度和 CUDA 算子 |
 | `he_only/` | OpenFHE CKKS CPU 与 Perseus CUDA 的密态生成、回灌和解密 |
 | `he_mpc/` | BFV 与 MP-SPDZ 两方计算的端侧客户端、独立求值端和原生依赖构建 |
 | `scripts/` | 公开数据获取、数据生成、非 IID 划分和构建时质量检查 |
@@ -26,13 +27,21 @@ bash run.sh agent --config config.local.json --route local
 
 ### GPU 加速的本地生成
 
-在本地安装 [dzyy-vllm](https://github.com/dzyy-team/dzyy-vllm) 及与当前 PyTorch/CUDA 匹配的 FlashAttention、FlashInfer 和 Triton。在 `config.local.json` 增加配置项。
+加速引擎随项目源码和 Python 包交付。先准备本地 Qwen3 权重和 CUDA 环境，安装与 Python、PyTorch 及 CUDA ABI 匹配的 FlashAttention wheel，再安装项目依赖。
+
+```bash
+python -m pip install /path/to/compatible-flash-attn.whl
+python -m pip install --only-binary flash-attn -e '.[agent,gpu]'
+```
+
+验证使用 Python 3.12、PyTorch `2.13.0+cu130`、FlashAttention 2.8.3、FlashInfer 0.7.2.post1 和 Triton 3.7.1。FlashInfer 如需编译内核，还须准备兼容的 CUDA 工具链与 C++ 编译器，或在环境中预装匹配的 FlashInfer 内核包。内置实现源于 [dzyy-vllm](https://github.com/dzyy-team/dzyy-vllm)，许可随源码附于 [LICENSE](privacy_infer/accelerated/LICENSE)。
+
+在 `config.local.json` 中选择加速后端。最少需要填写 `model_path` 和 `answer_backend`。
 
 ```json
 {
   "model_path": "/path/to/Qwen3-1.7B",
   "answer_backend": "accelerated",
-  "dzyy_engine_path": "/path/to/dzyy-vllm/vllm-v3",
   "max_batch_size": 2,
   "prefill_chunk_tokens": 512,
   "prefix_cache": "none",

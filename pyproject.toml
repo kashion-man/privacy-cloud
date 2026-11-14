@@ -12,6 +12,16 @@ dependencies = ["torch>=2.5", "transformers>=4.51,<6", "safetensors>=0.4"]
 [project.optional-dependencies]
 agent = ["langgraph==1.2.21"]
 train = ["accelerate>=1,<2", "peft>=0.13,<1"]
+gpu = [
+    "flash-attn>=2.8.3,<3",
+    "flashinfer-python==0.7.2.post1",
+    "triton>=3.3,<4",
+    "tokenizers>=0.22,<1",
+    "numpy>=1.26",
+    "tqdm>=4.66",
+    "xxhash>=3",
+    "ninja>=1.11",
+]
 
 [project.scripts]
 privacy-infer = "privacy_infer.cli:main"
@@ -22,3 +32,4 @@ include = ["privacy_infer*"]
 
 [tool.setuptools.package-data]
 "privacy_infer.eager" = ["LICENSE"]
+"privacy_infer.accelerated" = ["LICENSE"]

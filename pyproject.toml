@@ -22,6 +22,7 @@ gpu = [
     "xxhash>=3",
     "ninja>=1.11",
 ]
+parallel = ["torch>=2.9", "msgspec>=0.18,<1", "pyzmq>=25"]
 
 [project.scripts]
 privacy-infer = "privacy_infer.cli:main"
@@ -33,3 +34,4 @@ include = ["privacy_infer*"]
 [tool.setuptools.package-data]
 "privacy_infer.eager" = ["LICENSE"]
 "privacy_infer.accelerated" = ["LICENSE"]
+"privacy_infer.parallel" = ["LICENSE"]

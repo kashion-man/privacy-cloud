@@ -69,12 +69,16 @@ def main(argv=None):
 
             def shadow(task, context):
                 return load_shadow().inspect(task, context)
-        agent = PrivacyAgent(LocalModel(config),
+        model = LocalModel(config)
+        agent = PrivacyAgent(model,
                              DeepSeekClient(config.cloud_model, config.cloud_timeout, config.cloud_max_tokens),
                              permissions=Permissions(args.allow_cloud, frozenset(args.allow_tool)),
                              max_chars=config.max_input_chars, shadow=shadow)
-        result = agent.run(task, context, preferred_route=args.route, approve=approve_on_tty,
-                           max_new_tokens=args.max_new_tokens)
+        try:
+            result = agent.run(task, context, preferred_route=args.route, approve=approve_on_tty,
+                               max_new_tokens=args.max_new_tokens)
+        finally:
+            model.release_answer_backend()
         print(terminal_json(result))
         return 1 if result["outcome"] == "blocked" else 0
     except PrivacyError as exc:

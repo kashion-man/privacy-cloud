@@ -53,6 +53,26 @@ python -m pip install --only-binary flash-attn -e '.[agent,gpu]'
 
 加速后端用于 `agent` 的本地最终回答及 `infer local`。分页 KV、分块 prefill、融合算子和 FlashAttention 随该后端启用。显式批处理命令为 `bash run.sh infer local-batch --config config.local.json --input batch.json`，其中 `batch.json` 是含 `task`、`context` 对象的数组。前缀索引可选 `hash` 或 `radix`，只在同一显式批次内共享，批次结束清空索引和 KV。设置 `compile_prefill: true` 可启用 prefill 编译，首次运行需预热。路由和 NER 使用 eager 后端，ProSan 保留可微前向。两种引擎按需切换以避免同时驻留两套权重。
 
+### 单机多卡推理
+
+在已配置的 GPU 环境安装 `python -m pip install -e '.[agent,gpu,parallel]'`，并使用支持 NCCL 和 Gloo 的 PyTorch。多卡执行器随项目交付，支持稠密 Qwen3。两卡批处理配置示例：
+
+```json
+{
+  "model_path": "/path/to/Qwen3-1.7B",
+  "answer_backend": "accelerated",
+  "gpu_devices": [0, 1],
+  "data_parallel": 2,
+  "max_batch_size": 4
+}
+```
+
+- `data_parallel` 把显式批次分给多个完整模型副本，面向并发吞吐。通常用 `infer local-batch`，单条请求只在一个副本生成。
+- `tensor_parallel` 在多个 GPU 间切分注意力头、线性层和词表。张量并行度须整除 Q 头数、KV 头数及 MLP 中间维度。
+- `pipeline_parallel` 按层切阶段，经 NCCL 发送激活。可用 `pipeline_layers` 指定各阶段层数，例如 Qwen3-1.7B 的 `[14, 14]`。
+
+`gpu_devices` 是 `CUDA_VISIBLE_DEVICES` 映射后的逻辑编号，数量等于 `tensor_parallel × pipeline_parallel × data_parallel`。三种并行度默认为 1。选用多卡时逐卡清空请求 KV，DP 副本完成清理后才返回。CUDA Graph 可用 `cuda_graph` 控制。多卡使用同步解码调度，`parallel_timeout` 默认 120 秒。TP 和 PP 的性能取决于卡间互联以及模型大小。DP、TP 和 PP 均用于同一可信主机内的明文推理。
+
 ## 密态推理
 
 HE-only 和 HE-MPC 由独立命令启动。整模型密态自回归仍待验收。

@@ -4,6 +4,7 @@ import json
 import math
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 from threading import RLock
 
 from .errors import PrivacyError
@@ -29,26 +30,53 @@ class FastAnswer:
         self.prefix_backend = config.prefix_cache
         self.torch = torch
         self.engine = None
+        self._rendezvous = None
+        self.parallel = config.parallel_gpus > 1
         with _ENGINE_LOCK, redirect_stdout(sys.stderr):
-            from .accelerated.config import EngineConfig
-            from .accelerated.control.engine import Engine
+            parallel_settings = {}
+            if self.parallel:
+                if not torch.distributed.is_nccl_available():
+                    raise PrivacyError("Multi-GPU inference requires PyTorch with NCCL")
+                if any(i >= torch.cuda.device_count() for i in config.gpu_devices):
+                    raise PrivacyError("A configured GPU is not visible to PyTorch")
+                if torch.distributed.is_initialized():
+                    raise PrivacyError("Multi-GPU inference requires its own local process group")
+                from .parallel import Engine, EngineConfig
 
-            settings = EngineConfig(
-                model=str(model), context_len=config.context_len,
-                max_num_seqs=self.max_batch, max_num_batched_tokens=config.prefill_chunk_tokens,
-                num_kvcache_blocks=math.ceil(config.context_len / 256) * self.max_batch,
-                prefix_backend=self.prefix_backend, enforce_eager=not config.cuda_graph,
-                torch_compile=config.compile_prefill, enable_zos=config.async_decode, dtype="bfloat16",
-            )
-            if settings.context_len != config.context_len or settings.hf_config.model_type != "qwen3":
-                raise PrivacyError("The accelerated engine requires dense Qwen3 and a valid context length")
+                self._rendezvous = TemporaryDirectory(prefix="privacy_gpu_")
+                parallel_settings = dict(
+                    tp_size=config.tensor_parallel, pp_size=config.pipeline_parallel,
+                    dp_size=config.data_parallel, device_ids=list(config.gpu_devices),
+                    pp_layer_counts=config.pipeline_layers,
+                    rendezvous_path=str(Path(self._rendezvous.name) / "group"),
+                    timeout=config.parallel_timeout,
+                )
+            else:
+                from .accelerated import Engine, EngineConfig
+
+            slots = math.ceil(self.max_batch / config.data_parallel)
             reduction = torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
             try:
+                settings = EngineConfig(
+                    model=str(model), context_len=config.context_len,
+                    max_num_seqs=slots, max_num_batched_tokens=config.prefill_chunk_tokens,
+                    num_kvcache_blocks=math.ceil(config.context_len / 256) * slots,
+                    prefix_backend=self.prefix_backend, enforce_eager=not config.cuda_graph,
+                    torch_compile=config.compile_prefill,
+                    enable_zos=config.async_decode and not self.parallel, dtype="bfloat16",
+                    **parallel_settings,
+                )
+                if settings.context_len != config.context_len or settings.hf_config.model_type != "qwen3":
+                    raise PrivacyError("The accelerated engine requires dense Qwen3 and a valid context length")
                 self.engine = Engine(settings)
+            except BaseException:
+                self.close()
+                raise
             finally:
                 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = reduction
         self.tokenizer = self.engine.tokenizer
-        self.engine.scheduler.eos = frozenset([self.engine.eos_token_id])
+        if not self.parallel:
+            self.engine.scheduler.eos = frozenset([self.engine.eos_token_id])
 
     def encode(self, system, text):
         rendered = self.tokenizer.apply_chat_template(
@@ -58,7 +86,10 @@ class FastAnswer:
 
     def generate(self, prompts, max_new_tokens):
         """Generate one explicitly grouped batch, with cache state scoped to this call."""
-        from .accelerated.sampling_params import SamplingParams
+        if self.parallel:
+            from .parallel.sampling_params import SamplingParams
+        else:
+            from .accelerated.sampling_params import SamplingParams
 
         if not prompts or len(prompts) > self.max_batch or type(max_new_tokens) is not int or max_new_tokens < 0:
             raise ValueError("Invalid accelerated engine request count or generation budget")
@@ -73,12 +104,22 @@ class FastAnswer:
             try:
                 params = SamplingParams(max_tokens=max_new_tokens, temperature=0)
                 sequences = [engine.add_request(ids, params) for ids in prompts]
-                while not engine.scheduler.is_finished():
-                    engine.step()
+                if self.parallel:
+                    while engine.has_unfinished():
+                        engine.step()
+                    engine.clear_batch()
+                else:
+                    while not engine.scheduler.is_finished():
+                        engine.step()
                 return [self._decode(seq.token_ids[seq.num_prompt_tokens:]) for seq in sequences]
+            except BaseException:
+                if self.parallel:
+                    self.close()
+                raise
             finally:
                 try:
-                    self._clear_request_state()
+                    if not self.parallel:
+                        self._clear_request_state()
                 finally:
                     self.torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = reduction
 
@@ -120,6 +161,11 @@ class FastAnswer:
 
     def close(self):
         with _ENGINE_LOCK:
-            if self.engine is not None:
-                self.engine.destroy()
-                self.engine = None
+            try:
+                if self.engine is not None:
+                    engine, self.engine = self.engine, None
+                    engine.destroy()
+            finally:
+                if self._rendezvous is not None:
+                    self._rendezvous.cleanup()
+                    self._rendezvous = None

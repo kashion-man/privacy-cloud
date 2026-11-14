@@ -38,7 +38,11 @@ class LocalModel:
                 self._engine = None
                 self._fast = FastAnswer(self.config)
             prompts = [self._fast.encode(system, text) for system, text in messages]
-            return self._fast.generate(prompts, max_new_tokens)
+            try:
+                return self._fast.generate(prompts, max_new_tokens)
+            finally:
+                if self.config.parallel_gpus > 1 and self._fast.engine is None:
+                    self._fast = None
         except (ImportError, OSError, RuntimeError, ValueError) as exc:
             raise PrivacyError("Accelerated local answer failed; check CUDA dependencies, input length and memory") from exc
 

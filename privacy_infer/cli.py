@@ -71,7 +71,12 @@ def main(argv=None):
                 if type(task) is not str or type(context) is not str or len(task) + len(context) > config.max_input_chars:
                     raise PrivacyError("Invalid input or size limit exceeded")
                 messages.append(("You are a helpful assistant.", task + "\n\n" + context))
-            print(json.dumps(LocalModel(config).answer_many(messages, args.max_new_tokens),ensure_ascii=False))
+            model = LocalModel(config)
+            try:
+                answers = model.answer_many(messages, args.max_new_tokens)
+            finally:
+                model.release_answer_backend()
+            print(json.dumps(answers, ensure_ascii=False))
             return 0
         if args.input:
             if args.input.stat().st_size > config.max_input_chars * 12 + 1024:
@@ -88,7 +93,10 @@ def main(argv=None):
         from .local import LocalModel
         model = LocalModel(config)
         if args.command == "local":
-            print(model.answer("You are a helpful assistant.", task + "\n\n" + context, args.max_new_tokens))
+            try:
+                print(model.answer("You are a helpful assistant.", task + "\n\n" + context, args.max_new_tokens))
+            finally:
+                model.release_answer_backend()
             return 0
         from .cloud import DeepSeekClient
         from .detection import LocalDetector

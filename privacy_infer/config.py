@@ -32,10 +32,39 @@ class Config:
     cuda_graph: bool = True
     compile_prefill: bool = False
     async_decode: bool = True
+    tensor_parallel: int = 1
+    pipeline_parallel: int = 1
+    data_parallel: int = 1
+    gpu_devices: tuple[int, ...] | None = None
+    pipeline_layers: tuple[int, ...] | None = None
+    parallel_timeout: int = 120
 
     def __post_init__(self):
         if self.answer_backend not in {"eager", "accelerated"}:
             raise ValueError("Unknown local answer backend")
+        for size in (self.tensor_parallel, self.pipeline_parallel, self.data_parallel):
+            if type(size) is not int or size < 1:
+                raise ValueError("Parallel sizes must be positive integers")
+        if self.parallel_gpus > 1 and (self.answer_backend != "accelerated" or self.gpu_devices is None):
+            raise ValueError("Multi-GPU inference requires accelerated answers and explicit gpu_devices")
+        if self.gpu_devices is not None:
+            if not isinstance(self.gpu_devices, (list, tuple)):
+                raise ValueError("gpu_devices must be a list of visible device indices")
+            ids = tuple(self.gpu_devices)
+            if (len(ids) != self.parallel_gpus or any(type(i) is not int or i < 0 for i in ids)
+                    or len(set(ids)) != len(ids) or self.parallel_gpus == 1):
+                raise ValueError("gpu_devices must select one distinct visible device per parallel worker")
+            object.__setattr__(self, "gpu_devices", ids)
+        if self.pipeline_layers is not None:
+            if not isinstance(self.pipeline_layers, (list, tuple)):
+                raise ValueError("pipeline_layers must be a list of layer counts")
+            layers = tuple(self.pipeline_layers)
+            if (self.pipeline_parallel == 1 or len(layers) != self.pipeline_parallel
+                    or any(type(n) is not int or n < 1 for n in layers)):
+                raise ValueError("pipeline_layers must provide one positive count per pipeline stage")
+            object.__setattr__(self, "pipeline_layers", layers)
+        if type(self.parallel_timeout) is not int or self.parallel_timeout < 1:
+            raise ValueError("parallel_timeout must be a positive number of seconds")
         if self.prefix_cache not in {"none", "hash", "radix"}:
             raise ValueError("Invalid accelerated engine prefix backend")
         if type(self.prefill_chunk_tokens) is not int or not 2 <= self.prefill_chunk_tokens <= 8192:
@@ -77,6 +106,10 @@ class Config:
             object.__setattr__(self, "stamp_group_epsilons", values)
         if not all(math.isfinite(v * self.stamp_max_tokens) for v in self.stamp_budgets().values()):
             raise ValueError("STAMP budget exceeds numerical range")
+
+    @property
+    def parallel_gpus(self):
+        return self.tensor_parallel * self.pipeline_parallel * self.data_parallel
 
     def stamp_budgets(self):
         values = self.stamp_group_epsilons

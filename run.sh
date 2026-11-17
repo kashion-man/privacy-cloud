@@ -21,11 +21,12 @@ case "$command_name" in
   pack-train) exec "$python_bin" "$root/federated/pack.py" "$@" ;;
   fed-train) exec "$python_bin" "$root/federated/run.py" "$@" ;;
   pilot)    exec "$python_bin" "$root/federated/local_lora.py" "$@" ;;
+  eval-privacy) exec "$python_bin" "$root/federated/evaluate.py" "$@" ;;
   help|-h|--help)
     printf '%s\n' 'Usage: bash run.sh <command> [options]' \
       '  agent | infer' \
       '  calibrate | he-only | he-gpu | he-multi | he-mpc | he-mpc-server' \
-      '  fetch-data | build-data | revise-data | pack-train | fed-train | pilot'
+      '  fetch-data | build-data | revise-data | pack-train | fed-train | pilot | eval-privacy'
     ;;
   *) printf 'Unknown command: %s\n' "$command_name" >&2; exit 2 ;;
 esac

@@ -16,9 +16,9 @@ Qwen3-1.7B 端侧隐私 Agent、文本云推理、HE-only、HE-MPC 和 FedLoRA �
 | 方向 | 实测结果 | 测试范围 |
 | --- | --- | --- |
 | 端侧首字延迟与生成速率 | TTFT 中位数 **77.9 → 34.6 ms（−55.7%）**；单请求输出速率 **22.1 → 29.7 token/s（+34.8%）** | WSL RTX 4060 Laptop，Qwen3-1.7B，512-token 相同前缀复用，Radix 前缀缓存对比禁用前缀缓存 |
-| Agent 延迟 | P50 **527.49 → 292.81 ms（−44.5%）**，P95 **855.08 → 437.21 ms（−48.9%）**；每请求模型调用 **2 → 1** | 本地后续优化实测，同一批无外部权限的自动路由请求 |
-| 隐私与任务效用 | 候选正文中完整敏感值的字面检出率 **4.3% → 0.0%**；全部样例中安全且答对率 **21.4% → 85.7%** | 本地后续优化实测，84 条合成样例，含本地回退；优化后云端候选比例为 7.1%，全程离线 |
-| HE-MPC 密态 Argmax | MPC 会话耗时 **31.90 → 22.12 s（−30.7%）**，流量 **3,945.53 → 3,071.95 MB（−22.1%）**，解密 one-hot 最大误差 **0** | 本地后续优化实测，Qwen3 的 151,936 词全词表组件测试，真实两方 MPC 在本机回环运行 |
+| Agent 延迟 | P50 **527.49 → 292.81 ms（−44.5%）**，P95 **855.08 → 437.21 ms（−48.9%）**；每请求模型调用 **2 → 1** | WSL RTX 4060 Laptop，同一批无外部权限的自动路由请求 |
+| 隐私与任务效用 | 候选正文中完整敏感值的字面检出率 **4.3% → 0.0%**；全部样例中安全且答对率 **21.4% → 85.7%** | 84 条合成样例，含本地回退；优化后云端候选比例为 7.1%，全程离线 |
+| HE-MPC 密态 Argmax | MPC 会话耗时 **31.90 → 22.12 s（−30.7%）**，流量 **3,945.53 → 3,071.95 MB（−22.1%）**，解密 one-hot 最大误差 **0** | Qwen3 的 151,936 词全词表组件测试，真实两方 MPC 在本机回环运行 |
 | 联邦微调与隐私模块 | **10 个 Non-IID 客户端、20 轮 FedLoRA**；DP、MPC 及组合配置均通过合成测试，**1,605,632 维**定点安全聚合最大误差 **0** | 联邦基线关闭 DP 和安全聚合；组合防护的训练效用待测 |
 
 ## 本地 Agent
@@ -33,7 +33,9 @@ bash run.sh agent --config config.local.json --route local
 
 在 `config.local.json` 填入现有 Qwen3-1.7B Safetensors 检查点目录。若使用相对路径，以运行命令时的目录为基准。Agent 从终端隐藏输入读取任务和上下文，也接受仅含 `task` 和 `context` 的 UTF-8 JSON。可使用 `--allow-tool calculator` 或 `--allow-tool text_stats` 启用本地工具。
 
-文本云路径使用 `agent --route cloud --allow-cloud`，从本地环境读取 `DEEPSEEK_API_KEY`，并要求在交互终端核对本次脱敏正文后输入 `SEND`。旧版 ProSan/ STAMP 的离线预览可用 `infer sanitize`。旧版显式发送可以保留高敏感、高相关的原文。新 LoRA 可用 `agent --shadow-adapter /path/to/adapter` 在端侧查看统计。
+文本云路径可用 `agent --route cloud --allow-cloud` 或 `infer infer --send`。两个入口共用出站策略和 DeepSeek 客户端，从本地环境读取 `DEEPSEEK_API_KEY`，并要求在交互终端核对本次目的地和完整脱敏正文后输入 `SEND`。出站策略移除识别到的私人值，并在脱敏后的上下文可能无法完成任务时保留原文在端侧。Agent 会回退到本地回答。`infer sanitize` 可离线预览 ProSan 或 STAMP。`agent --shadow-adapter /path/to/adapter` 可在端侧查看 LoRA 的旁路统计。
+
+Agent 的 `--profile` 在本地结果中附加阶段毫秒数和主链路模型调用次数。审批等待与云端传输分别计时。总耗时包含子阶段，嵌套指标不应相加。
 
 ### GPU 加速的本地生成
 
@@ -122,3 +124,5 @@ bash run.sh fed-train --root runs/fed --model "$MODEL"
 ```
 
 `pack-train` 包含训练与验证数据及客户端清单。训练可以在准备好 CUDA 和对应 Qwen3 权重的服务器执行。启用可选隐私模块时，将 `privacy.example.json` 的设置写入运行目录 `config.json` 的 `privacy` 字段，再按实验配置修改开关。默认执行无 DP 与 MPC 的基线。集中式小试入口为 `bash run.sh pilot --dataset data/federated --model "$MODEL" --out runs/pilot`。
+
+用 `bash run.sh eval-privacy --help` 查看独立测试集对照命令。默认按反事实分组抽样，可用 `--all-test` 评估完整测试集。FedLoRA 权重通过对应轮次指标中的 SHA-256 校验后加载。

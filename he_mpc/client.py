@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -163,6 +164,12 @@ def main():
         report.update(generated_token_ids=tokens, token_onehot_max_errors=max_errors)
         report['generated_text'] = tokenizer.decode(tokens,skip_special_tokens=True)
         report.update(message)
+        mpc_traffic = []
+        for log_path in sorted((work/'mpc').glob('mpc-*.log')):
+            traffic = re.search(r'Global data sent = ([0-9.]+) MB', log_path.read_text(encoding="utf-8"))
+            if traffic is not None:
+                mpc_traffic.append(float(traffic[1]))
+        report['mpc_global_reported_mb'] = sum(mpc_traffic) if len(mpc_traffic) == mpc.calls and mpc_traffic else None
         report.update(success=True, elapsed_seconds=time.monotonic()-started,
                       protocol_bytes_sent=wire.sent, protocol_bytes_received=wire.received,
                       client_mpc_calls=mpc.calls, client_mpc_seconds=mpc.seconds,

@@ -5,6 +5,7 @@ import getpass
 import json
 from pathlib import Path
 import sys
+import unicodedata
 
 from .agent_policy import Permissions, TOOL_NAMES, strict_json, validate_inputs
 from .config import Config
@@ -12,8 +13,8 @@ from .errors import PrivacyError
 
 
 def terminal_json(value):
-    # JSON escapes C0 controls. Escape C1/DEL as well on terminals.
-    return "".join(f"\\u{ord(c):04x}" if 0x7f <= ord(c) <= 0x9f else c
+    # JSON escapes C0 controls. Escape remaining controls and invisible format characters.
+    return "".join(json.dumps(c, ensure_ascii=True)[1:-1] if unicodedata.category(c) in {"Cc", "Cf"} else c
                    for c in json.dumps(value, ensure_ascii=False))
 
 
@@ -48,6 +49,7 @@ def main(argv=None):
     parser.add_argument("--allow-cloud", action="store_true")
     parser.add_argument("--allow-tool", action="append", choices=sorted(TOOL_NAMES), default=[])
     parser.add_argument("--shadow-adapter", type=Path, help="本地 LoRA 旁路，只返回统计")
+    parser.add_argument("--profile", action="store_true", help="输出请求阶段耗时和模型调用次数")
     parser.add_argument("--max-new-tokens", type=int, default=256, choices=range(1,1025),
                         metavar="1..1024")
     args = parser.parse_args(argv)
@@ -76,7 +78,7 @@ def main(argv=None):
                              max_chars=config.max_input_chars, shadow=shadow)
         try:
             result = agent.run(task, context, preferred_route=args.route, approve=approve_on_tty,
-                               max_new_tokens=args.max_new_tokens)
+                               max_new_tokens=args.max_new_tokens, profile=args.profile)
         finally:
             model.release_answer_backend()
         print(terminal_json(result))

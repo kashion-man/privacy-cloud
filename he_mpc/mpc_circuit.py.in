@@ -102,15 +102,20 @@ elif OP == 'argmax':
     ys = []
     for block in range(len(xs)):
         ids = sint(regint.inc(N, block*N, 1))
-        ys.append(sfix._new((selected.expand_to_vector(N) == ids) * (2**F)))
+        # Equality already yields a nonnegative bit. Encode at the public
+        # BFV output scale directly, preserving the same masked residues.
+        ys.append((selected.expand_to_vector(N) == ids) * (2**OUT_F))
 else:
     raise ValueError('Unsupported MPC operation')
 
 for y in ys:
-    raw = y.v
-    if F > OUT_F:
-        raw = raw.round(k=41, m=F-OUT_F, nearest=True, signed=True)
-    raw = (raw < 0).if_else(raw + T, raw)
+    if OP == 'argmax':
+        raw = y
+    else:
+        raw = y.v
+        if F > OUT_F:
+            raw = raw.round(k=41, m=F-OUT_F, nearest=True, signed=True)
+        raw = (raw < 0).if_else(raw + T, raw)
     mask = sint.get_input_from(0, size=N)
     share = raw - mask
     share = (share < 0).if_else(share + T, share)

@@ -16,7 +16,7 @@ def main(argv=None):
     parser.add_argument("command", choices=["local", "local-batch", "sanitize", "infer"])
     parser.add_argument("--config", default="config.json")
     parser.add_argument("--input", type=Path, help="UTF-8 JSON with task and context; otherwise hidden interactive input")
-    parser.add_argument("--send", action="store_true", help="Send sanitized fields to DeepSeek (infer only)")
+    parser.add_argument("--send", action="store_true", help="Send through the Agent release policy after terminal approval (infer only)")
     parser.add_argument("--preview", action="store_true", help="Print sanitized text locally; may still contain missed private information")
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--privacy-mode", choices=["redact", "stamp"], default=None,
@@ -53,6 +53,8 @@ def main(argv=None):
             raise PrivacyError("STAMP budget options require --privacy-mode stamp")
         if args.send and args.command != "infer":
             raise PrivacyError("--send requires infer")
+        if args.send and overrides:
+            raise PrivacyError("ProSan and STAMP options are available for offline previews only")
         if args.send and not get_api_key():
             raise PrivacyError("Set DEEPSEEK_API_KEY before sending")
         if args.command == "local-batch":
@@ -102,7 +104,14 @@ def main(argv=None):
         from .detection import LocalDetector
         from .pipeline import Pipeline
         from .policy import PrivacyGate
-        if config.privacy_mode == "stamp":
+        approve = None
+        if args.send:
+            from .agent_cli import approve_on_tty, terminal_json
+            from .agent_policy import LocalDependencyJudge, ReleasePolicy
+
+            gate = ReleasePolicy(LocalDetector(model), config.max_input_chars, LocalDependencyJudge(model))
+            approve = approve_on_tty
+        elif config.privacy_mode == "stamp":
             from .stamp import StampGate
             gate = StampGate(LocalDetector(model), model, config)
         else:
@@ -115,14 +124,14 @@ def main(argv=None):
         pipeline = Pipeline(gate,
                             DeepSeekClient(os.environ.get("DEEPSEEK_MODEL", config.cloud_model),
                                            config.cloud_timeout, config.cloud_max_tokens))
-        request, report, answer = pipeline.run(task, context, dry_run=not args.send)
-        print(json.dumps({"sent": args.send, "privacy_mode": config.privacy_mode,
-                          "sensitive_importance": config.sensitive_importance,
-                          "report": asdict(report)}, ensure_ascii=False))
+        request, report, answer = pipeline.run(task, context, dry_run=not args.send, approve=approve)
+        print(json.dumps({"sent": args.send, "privacy_mode": "agent_release" if args.send else config.privacy_mode,
+                          "sensitive_importance": None if args.send else config.sensitive_importance,
+                          "report": {"redacted_spans": report} if args.send else asdict(report)}, ensure_ascii=False))
         if args.preview:
             print(json.dumps({"task": request.task, "context": request.context}, ensure_ascii=False))
         if answer is not None:
-            print(answer)
+            print(terminal_json({"answer": answer}))
         return 0
     except Exception:
         # Do not print arbitrary exception bodies (may contain prompts, secrets or API output).

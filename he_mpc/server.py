@@ -94,16 +94,30 @@ def main():
     vocab = int(c['vocab_size'])
     embedding = None
     tokens = []
+    phases = []
+
+    def measure(step, phase, fn, *args, **kwargs):
+        started = time.monotonic()
+        initial_mpc, initial_linear = mpc.seconds, ops.counts['linear_seconds']
+        initial_sent, initial_received = wire.sent, wire.received
+        value = fn(*args, **kwargs)
+        phases.append(dict(step=step, phase=phase, wall_seconds=time.monotonic()-started,
+                           mpc_session_seconds=mpc.seconds-initial_mpc,
+                           linear_inclusive_seconds=ops.counts['linear_seconds']-initial_linear,
+                           application_bytes_sent=wire.sent-initial_sent,
+                           application_bytes_received=wire.received-initial_received))
+        return value
+
     for step in range(steps):
         progress('forward_start', step=step, prefix_length=len(prefix))
-        logits = model.forward(prefix)
-        token = ops.mpc_op('argmax', logits, vocab=vocab)
+        logits = measure(step, 'forward', model.forward, prefix)
+        token = measure(step, 'argmax', ops.mpc_op, 'argmax', logits, vocab=vocab)
         tokens.append(token)
         progress('encrypted_token_ready', step=step, counts=ops.counts)
         if step+1 < steps:
             if embedding is None:
                 embedding = weights.tensor('model.embed_tokens.weight')
-            feedback = ops.linear(token, embedding.T)
+            feedback = measure(step, 'feedback', ops.linear, token, embedding.T)
             if len(feedback) != 1:
                 raise ValueError('Invalid encrypted embedding feedback')
             prefix.append(feedback[0])
@@ -114,6 +128,7 @@ def main():
         wire.send(dict(type='tokens', step=step, values=[he.encode(x) for x in token]))
     wire.send(dict(type='done',
                    counts=ops.counts, mpc_seconds=mpc.seconds, seconds=time.monotonic()-started,
+                   generation_profile=phases,
                    kv_cache=False, server_has_secret_key=False,
                    intermediate_activation_reconstructions=0, model="qwen", vocab=vocab))
     progress('done', counts=ops.counts)

@@ -1,0 +1,14 @@
+{
+  "root": "/home/benchmark/dzyy-vllm/dzyy-vllm/vllm-v3",
+  "revision": "87d7e49fd2758b37690fa0292cb313002baddf7e",
+  "bench_sha256": {
+    "bench/common.py": "5583abde0783dd248ff6431b2418167fe3b3b07084051a59fbe5b44a775715eb",
+    "bench/compare.py": "c3c0d25db217dc69ba3e7adfaf4e1dc6e4b81dddc0e729ccb3b2ef7105820959",
+    "bench/kernels.py": "c82d59f385be3063ff4e70379b4ac37449457064a603b9aabff7d8610535ac6a",
+    "bench/loading.py": "67bc915ed9b9022249a1fab1fb746e8dd0f755afad1b086d47ea8e32aff9d3a1",
+    "bench/profiling.py": "235c98b2842754a681c426c4ad33a807a9a1b83b8b77851686f42aafa02d217b",
+    "bench/reference.py": "2bb2788108cf0c703eb6bb04bb3c2633c5eef3f892c62ec9aaed06fd7fddcc75",
+    "bench/run.py": "b1694437f2996a44dd97a7681cf4ce18680452ef18c8dd46675dfb4ae477c069",
+    "bench/workloads.py": "77b6e0eb6b197a6145063012f2fcaa80b16d47cf47748277aac9f3049fa9e869"
+  }
+}

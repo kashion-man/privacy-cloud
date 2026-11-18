@@ -1,0 +1,32 @@
+{
+  "repeats": 3,
+  "statistics": "median",
+  "results": {
+    "qwen-single-eager": {
+      "ttft_ms": 21.56,
+      "decode_tps": 58.7,
+      "batch_tps": 417.0
+    },
+    "qwen-single-graph": {
+      "ttft_ms": 20.98,
+      "decode_tps": 223.5,
+      "batch_tps": 1422.4
+    },
+    "qwen-tensor-graph": {
+      "ttft_ms": 30.9,
+      "decode_tps": 233.8,
+      "batch_tps": 1176.6
+    },
+    "qwen-pipeline-graph": {
+      "ttft_ms": 27.03,
+      "decode_tps": 167.0,
+      "batch_tps": 1083.5
+    },
+    "qwen-data-graph": {
+      "throughput_tps": 5372.6
+    },
+    "qwen-data-reference": {
+      "throughput_tps": 4924.5
+    }
+  }
+}
